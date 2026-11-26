@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,23 @@ func waitReady(t *testing.T, addr string) {
 	t.Fatalf("server at %s never became ready", addr)
 }
 
+func waitActiveRequest(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/-/metrics")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if strings.Contains(string(body), "gostore_active_requests 1") {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("server at %s never observed active request", addr)
+}
+
 func signReq(t *testing.T, req *http.Request, payloadHash, access, secret string) {
 	t.Helper()
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
@@ -66,7 +84,7 @@ func TestRunServerGracefulDrainAndPprof(t *testing.T) {
 		Addr:                  addr,
 		PprofAddr:             pprofAddr,
 		DataDir:               dataDir,
-		ShutdownTimeout:       2 * time.Second,
+		ShutdownTimeout:       5 * time.Second,
 		IdleTransferTimeout:   5 * time.Second,
 		MaxConcurrentRequests: 16,
 		MaxObjectSize:         1 << 20,
@@ -119,23 +137,27 @@ func TestRunServerGracefulDrainAndPprof(t *testing.T) {
 	uReq.ContentLength = int64(len(payload))
 	signReq(t, uReq, hex.EncodeToString(sum[:]), cfg.AccessKey, cfg.SecretKey)
 
-	uResCh := make(chan int, 1)
+	type uploadRes struct {
+		code int
+		err  error
+	}
+	uResCh := make(chan uploadRes, 1)
 	go func() {
 		resp, err := http.DefaultClient.Do(uReq)
 		if err != nil {
-			t.Error(err)
+			uResCh <- uploadRes{err: err}
 			return
 		}
 		resp.Body.Close()
-		uResCh <- resp.StatusCode
+		uResCh <- uploadRes{code: resp.StatusCode}
 	}()
 
-	// Write first half so server has entered PutObject handler.
+	// Write first half and wait until the server is actively inside PutObject.
 	if _, err := pw.Write(payload[:4]); err != nil {
 		t.Fatal(err)
 	}
+	waitActiveRequest(t, addr)
 	cancel()
-	time.Sleep(30 * time.Millisecond)
 
 	// Complete the in-flight upload; it must drain and commit cleanly.
 	if _, err := pw.Write(payload[4:]); err != nil {
@@ -143,8 +165,9 @@ func TestRunServerGracefulDrainAndPprof(t *testing.T) {
 	}
 	_ = pw.Close()
 
-	if code := <-uResCh; code != http.StatusOK {
-		t.Fatalf("drained upload status=%d", code)
+	res := <-uResCh
+	if res.err != nil || res.code != http.StatusOK {
+		t.Fatalf("drained upload failed: status=%d err=%v", res.code, res.err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("runServer returned error: %v", err)
@@ -217,6 +240,7 @@ func TestRunServerDeadlineCancelsStalledRequests(t *testing.T) {
 		}
 	}()
 	_, _ = pw.Write([]byte("abc"))
+	waitActiveRequest(t, addr)
 
 	start := time.Now()
 	cancel()
