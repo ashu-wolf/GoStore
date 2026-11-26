@@ -99,12 +99,15 @@ func (s *Store) snapshotMultipart() []record {
 // CreateUpload records a new active multipart upload.
 func (s *Store) CreateUpload(u domain.Upload) error {
 	u.Metadata = maps.Clone(u.Metadata)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.buckets[u.Bucket] == nil {
-		return domain.ErrNoSuchBucket
-	}
-	return s.commit(record{Op: opCreateUpload, Upload: &u})
+	return s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(u.Bucket) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		if ov.getUpload(u.ID) != nil {
+			return nil, fmt.Errorf("duplicate upload %q", u.ID)
+		}
+		return []record{{Op: opCreateUpload, Upload: &u}}, nil
+	})
 }
 
 // HasUpload verifies that the bucket and active upload exist for (bucket, key).
@@ -123,20 +126,21 @@ func (s *Store) HasUpload(bucket, key, uploadID string) error {
 
 // PutPart stores or replaces a part record and returns any replaced blob ID.
 func (s *Store) PutPart(bucket, key string, p domain.Part) (oldBlobID string, err error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.buckets[bucket] == nil {
-		return "", domain.ErrNoSuchBucket
-	}
-	u := s.uploads[p.UploadID]
-	if u == nil || u.info.Bucket != bucket || u.info.Key != key {
-		return "", domain.ErrNoSuchUpload
-	}
-	old := u.parts[p.Number].BlobID
-	if err := s.commit(record{Op: opPutPart, Part: &p}); err != nil {
+	err = s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(bucket) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		u := ov.getUpload(p.UploadID)
+		if u == nil || u.info.Bucket != bucket || u.info.Key != key {
+			return nil, domain.ErrNoSuchUpload
+		}
+		oldBlobID = u.parts[p.Number].BlobID
+		return []record{{Op: opPutPart, Part: &p}}, nil
+	})
+	if err != nil {
 		return "", err
 	}
-	return old, nil
+	return oldBlobID, nil
 }
 
 // UploadSnapshot returns the upload info and sorted parts, invoking pinFn
@@ -209,20 +213,22 @@ func (s *Store) ListParts(opts domain.ListPartsOptions) (domain.ListPartsResult,
 
 // AbortUpload removes an active upload and returns its part blob IDs.
 func (s *Store) AbortUpload(bucket, key, uploadID string) ([]string, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.buckets[bucket] == nil {
-		return nil, domain.ErrNoSuchBucket
-	}
-	u := s.uploads[uploadID]
-	if u == nil || u.info.Bucket != bucket || u.info.Key != key {
-		return nil, domain.ErrNoSuchUpload
-	}
-	blobIDs := make([]string, 0, len(u.parts))
-	for _, p := range u.parts {
-		blobIDs = append(blobIDs, p.BlobID)
-	}
-	if err := s.commit(record{Op: opAbortUpload, Upload: &domain.Upload{ID: uploadID}}); err != nil {
+	var blobIDs []string
+	err := s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(bucket) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		u := ov.getUpload(uploadID)
+		if u == nil || u.info.Bucket != bucket || u.info.Key != key {
+			return nil, domain.ErrNoSuchUpload
+		}
+		blobIDs = make([]string, 0, len(u.parts))
+		for _, p := range u.parts {
+			blobIDs = append(blobIDs, p.BlobID)
+		}
+		return []record{{Op: opAbortUpload, Upload: &domain.Upload{ID: uploadID}}}, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return blobIDs, nil
@@ -250,96 +256,103 @@ func (s *Store) CompleteUpload(
 	retention time.Duration,
 ) (alreadyCompleted bool, res domain.CompletedUpload, oldObjBlobID string, partBlobIDs []string, err error) {
 	obj.Metadata = maps.Clone(obj.Metadata)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	b := s.buckets[obj.Bucket]
-	if b == nil {
-		return false, domain.CompletedUpload{}, "", nil, domain.ErrNoSuchBucket
-	}
-	if c, ok := s.completions[uploadID]; ok && c.Bucket == obj.Bucket && c.Key == obj.Key && now.Sub(c.CompletedAt) < retention {
-		return true, c, "", nil, nil
-	}
-	u := s.uploads[uploadID]
-	if u == nil || u.info.Bucket != obj.Bucket || u.info.Key != obj.Key {
-		return false, domain.CompletedUpload{}, "", nil, domain.ErrNoSuchUpload
-	}
-	for _, want := range expected {
-		got, ok := u.parts[want.Number]
-		if !ok || got.BlobID != want.BlobID {
-			return false, domain.CompletedUpload{}, "", nil, domain.ErrInvalidPart
+	err = s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(obj.Bucket) {
+			return nil, domain.ErrNoSuchBucket
 		}
-	}
+		if c, ok := ov.getCompletion(uploadID); ok && c.Bucket == obj.Bucket && c.Key == obj.Key && now.Sub(c.CompletedAt) < retention {
+			alreadyCompleted = true
+			res = c
+			return nil, nil
+		}
+		u := ov.getUpload(uploadID)
+		if u == nil || u.info.Bucket != obj.Bucket || u.info.Key != obj.Key {
+			return nil, domain.ErrNoSuchUpload
+		}
+		for _, want := range expected {
+			got, ok := u.parts[want.Number]
+			if !ok || got.BlobID != want.BlobID {
+				return nil, domain.ErrInvalidPart
+			}
+		}
 
-	if obj.ContentType == "" {
-		obj.ContentType = u.info.ContentType
-	}
-	if obj.Metadata == nil && u.info.Metadata != nil {
-		obj.Metadata = maps.Clone(u.info.Metadata)
-	}
-	oldObjBlobID = b.objects[obj.Key].BlobID
-	for _, p := range u.parts {
-		partBlobIDs = append(partBlobIDs, p.BlobID)
-	}
-
-	err = s.commit(record{
-		Op:        opCompleteUpload,
-		Upload:    &domain.Upload{ID: uploadID},
-		Object:    &obj,
-		Completed: &completed,
+		merged := obj
+		if merged.ContentType == "" {
+			merged.ContentType = u.info.ContentType
+		}
+		if merged.Metadata == nil && u.info.Metadata != nil {
+			merged.Metadata = maps.Clone(u.info.Metadata)
+		}
+		_, oldObjBlobID = ov.getObject(merged.Bucket, merged.Key)
+		partBlobIDs = make([]string, 0, len(u.parts))
+		for _, p := range u.parts {
+			partBlobIDs = append(partBlobIDs, p.BlobID)
+		}
+		res = completed
+		return []record{{
+			Op:        opCompleteUpload,
+			Upload:    &domain.Upload{ID: uploadID},
+			Object:    &merged,
+			Completed: &completed,
+		}}, nil
 	})
 	if err != nil {
 		return false, domain.CompletedUpload{}, "", nil, err
 	}
-	return false, completed, oldObjBlobID, partBlobIDs, nil
+	if alreadyCompleted {
+		return true, res, "", nil, nil
+	}
+	return false, res, oldObjBlobID, partBlobIDs, nil
 }
 
 // ExpireUploads aborts inactive uploads older than uploadCutoff and purges
 // completion records older than completionCutoff.
 func (s *Store) ExpireUploads(uploadCutoff, completionCutoff time.Time, isActive func(string) bool) (expiredBlobs []string, expiredCount int, err error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	err = s.submit(func(ov *batchOverlay) ([]record, error) {
+		var toAbort []string
+		for _, id := range ov.allUploadIDs() {
+			u := ov.getUpload(id)
+			if u == nil || !u.info.LastActiveAt.Before(uploadCutoff) {
+				continue
+			}
+			if isActive != nil && isActive(id) {
+				continue
+			}
+			toAbort = append(toAbort, id)
+		}
+		slices.Sort(toAbort)
+		const maxExpirePerRun = 100
+		if len(toAbort) > maxExpirePerRun {
+			toAbort = toAbort[:maxExpirePerRun]
+		}
 
-	var toAbort []string
-	for id, u := range s.uploads {
-		if !u.info.LastActiveAt.Before(uploadCutoff) {
-			continue
+		var toPurge []string
+		for _, id := range ov.allCompletionIDs() {
+			c, ok := ov.getCompletion(id)
+			if ok && c.CompletedAt.Before(completionCutoff) {
+				toPurge = append(toPurge, id)
+			}
 		}
-		if isActive != nil && isActive(id) {
-			continue
-		}
-		toAbort = append(toAbort, id)
-	}
-	slices.Sort(toAbort)
-	const maxExpirePerRun = 100
-	if len(toAbort) > maxExpirePerRun {
-		toAbort = toAbort[:maxExpirePerRun]
-	}
+		slices.Sort(toPurge)
 
-	for _, id := range toAbort {
-		u := s.uploads[id]
-		for _, p := range u.parts {
-			expiredBlobs = append(expiredBlobs, p.BlobID)
+		recs := make([]record, 0, len(toAbort)+len(toPurge))
+		expiredBlobs = nil
+		for _, id := range toAbort {
+			u := ov.getUpload(id)
+			for _, p := range u.parts {
+				expiredBlobs = append(expiredBlobs, p.BlobID)
+			}
+			recs = append(recs, record{Op: opAbortUpload, Upload: &domain.Upload{ID: id}})
 		}
-		if err := s.commit(record{Op: opAbortUpload, Upload: &domain.Upload{ID: id}}); err != nil {
-			return expiredBlobs, expiredCount, err
+		expiredCount = len(toAbort)
+		for _, id := range toPurge {
+			recs = append(recs, record{Op: opPurgeCompletion, Completed: &domain.CompletedUpload{UploadID: id}})
 		}
-		expiredCount++
+		return recs, nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-
-	var toPurge []string
-	for id, c := range s.completions {
-		if c.CompletedAt.Before(completionCutoff) {
-			toPurge = append(toPurge, id)
-		}
-	}
-	slices.Sort(toPurge)
-	for _, id := range toPurge {
-		if err := s.commit(record{Op: opPurgeCompletion, Completed: &domain.CompletedUpload{UploadID: id}}); err != nil {
-			return expiredBlobs, expiredCount, err
-		}
-	}
-
 	return expiredBlobs, expiredCount, nil
 }
 

@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ashu-wolf/gostore/internal/domain"
 )
@@ -417,5 +420,132 @@ func TestListObjectsPaginationBoundaries(t *testing.T) {
 					tc.name, pageSize, gotObjs, gotPrefixes, tc.wantObjects, tc.wantPrefixes)
 			}
 		}
+	}
+}
+
+type countingSyncJournal struct {
+	journalFile
+	syncs       atomic.Int32
+	firstSyncIn chan struct{}
+	releaseSync chan struct{}
+}
+
+func (c *countingSyncJournal) Sync() error {
+	n := c.syncs.Add(1)
+	if n == 1 && c.firstSyncIn != nil {
+		close(c.firstSyncIn)
+		<-c.releaseSync
+	}
+	return c.journalFile.Sync()
+}
+
+func TestGroupCommitCoalescesConcurrentSyncs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta.journal")
+	s, _ := open(t, path)
+	must(t, s.CreateBucket(domain.Bucket{Name: "photos"}))
+
+	cj := &countingSyncJournal{
+		journalFile: s.journal,
+		firstSyncIn: make(chan struct{}),
+		releaseSync: make(chan struct{}),
+	}
+	s.journal = cj
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := s.PutObject(domain.Object{Bucket: "photos", Key: "first", BlobID: "b0"})
+		must(t, err)
+	}()
+
+	// Hold the first Sync while 8 concurrent commits queue up.
+	<-cj.firstSyncIn
+	const waiters = 8
+	for i := 0; i < waiters; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := "k-" + string(rune('a'+idx))
+			_, err := s.PutObject(domain.Object{Bucket: "photos", Key: key, BlobID: "b"})
+			must(t, err)
+		}(i)
+	}
+	time.Sleep(15 * time.Millisecond)
+	close(cj.releaseSync)
+	wg.Wait()
+
+	if got := cj.syncs.Load(); got >= waiters {
+		t.Fatalf("expected group commit to coalesce syncs, got %d sync calls for %d writes", got, waiters+1)
+	}
+	must(t, s.Close())
+
+	reopened, _ := open(t, path)
+	if _, err := reopened.Object("photos", "first"); err != nil {
+		t.Fatalf("missing first object after reopen: %v", err)
+	}
+	for i := 0; i < waiters; i++ {
+		key := "k-" + string(rune('a'+i))
+		if _, err := reopened.Object("photos", key); err != nil {
+			t.Fatalf("missing %s after reopen: %v", key, err)
+		}
+	}
+}
+
+func TestGroupCommitConflictOrdering(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta.journal")
+	s, _ := open(t, path)
+	must(t, s.CreateBucket(domain.Bucket{Name: "photos"}))
+
+	cj := &countingSyncJournal{
+		journalFile: s.journal,
+		firstSyncIn: make(chan struct{}),
+		releaseSync: make(chan struct{}),
+	}
+	s.journal = cj
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := s.PutObject(domain.Object{Bucket: "photos", Key: "blocker", BlobID: "b0"})
+		must(t, err)
+	}()
+	<-cj.firstSyncIn
+
+	// Queue conflicting writes on the same key and a bucket deletion in the same batch.
+	var (
+		old1, old2 string
+		delErr     error
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		var err error
+		old1, err = s.PutObject(domain.Object{Bucket: "photos", Key: "shared", BlobID: "b1"})
+		must(t, err)
+	}()
+	time.Sleep(5 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		var err error
+		old2, err = s.PutObject(domain.Object{Bucket: "photos", Key: "shared", BlobID: "b2"})
+		must(t, err)
+	}()
+	time.Sleep(5 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		delErr = s.DeleteBucket("photos")
+	}()
+	time.Sleep(10 * time.Millisecond)
+	close(cj.releaseSync)
+	wg.Wait()
+
+	if !errors.Is(delErr, domain.ErrBucketNotEmpty) {
+		t.Fatalf("DeleteBucket err = %v, want ErrBucketNotEmpty", delErr)
+	}
+	// Exactly one overwrite saw the earlier write's blob ID.
+	if !((old1 == "" && old2 == "b1") || (old2 == "" && old1 == "b2")) {
+		t.Fatalf("unexpected replaced blob IDs: old1=%q old2=%q", old1, old2)
 	}
 }

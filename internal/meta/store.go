@@ -21,7 +21,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ashu-wolf/gostore/internal/crashpoint"
 	"github.com/ashu-wolf/gostore/internal/domain"
 )
 
@@ -66,9 +65,12 @@ type OpenReport struct {
 
 // Store is safe for concurrent use.
 type Store struct {
-	writeMu sync.Mutex // orders changes; held while syncing
-	journal journalFile
-	failed  error
+	writeMu  sync.Mutex // serializes disk flushes and Close
+	queueMu  sync.Mutex // protects pending group-commit queue
+	pending  []*writeReq
+	flushing bool
+	journal  journalFile
+	failed   error
 
 	mu          sync.RWMutex // protects buckets, uploads, and completions; never held while syncing
 	buckets     map[string]*bucketState
@@ -131,30 +133,10 @@ func Open(path string, allowCreate bool) (*Store, OpenReport, error) {
 func (s *Store) Close() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.journal == nil {
+		return nil
+	}
 	return s.journal.Close()
-}
-
-// commit appends, syncs and then applies a record. The caller holds writeMu.
-func (s *Store) commit(r record) error {
-	if s.failed != nil {
-		return s.failed
-	}
-	buf, err := encode(r)
-	if err != nil {
-		return err
-	}
-	if _, err := s.journal.Write(buf); err != nil {
-		s.failed = fmt.Errorf("%w: %w", ErrCommitUnknown, err)
-		return s.failed
-	}
-	crashpoint.Hit("meta.after-write")
-	if err := s.journal.Sync(); err != nil {
-		s.failed = fmt.Errorf("%w: %w", ErrCommitUnknown, err)
-		return s.failed
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.apply(r)
 }
 
 // apply changes the in-memory state. It rejects changes that do not fit it.
@@ -212,68 +194,64 @@ func (s *Store) snapshot() []record {
 	return out
 }
 
-// Only writers change the maps, and they all hold writeMu. A writer may
-// therefore read the maps without taking mu.
-
 // CreateBucket adds a bucket.
 func (s *Store) CreateBucket(b domain.Bucket) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.buckets[b.Name] != nil {
-		return domain.ErrBucketExists
-	}
-	return s.commit(record{Op: opCreateBucket, Bucket: &b})
+	return s.submit(func(ov *batchOverlay) ([]record, error) {
+		if ov.hasBucket(b.Name) {
+			return nil, domain.ErrBucketExists
+		}
+		return []record{{Op: opCreateBucket, Bucket: &b}}, nil
+	})
 }
 
 // DeleteBucket removes an empty bucket. The check and removal are atomic.
 func (s *Store) DeleteBucket(name string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	b := s.buckets[name]
-	if b == nil {
-		return domain.ErrNoSuchBucket
-	}
-	if len(b.objects) > 0 {
-		return domain.ErrBucketNotEmpty
-	}
-	return s.commit(record{Op: opDeleteBucket, Bucket: &domain.Bucket{Name: name}})
+	return s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(name) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		if ov.bucketObjCount(name) > 0 {
+			return nil, domain.ErrBucketNotEmpty
+		}
+		return []record{{Op: opDeleteBucket, Bucket: &domain.Bucket{Name: name}}}, nil
+	})
 }
 
 // PutObject saves an object record. It returns the blob ID that it replaced,
 // or an empty string.
 func (s *Store) PutObject(o domain.Object) (oldBlobID string, err error) {
 	o.Metadata = maps.Clone(o.Metadata)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	b := s.buckets[o.Bucket]
-	if b == nil {
-		return "", domain.ErrNoSuchBucket
-	}
-	old := b.objects[o.Key].BlobID
-	if err := s.commit(record{Op: opPutObject, Object: &o}); err != nil {
+	err = s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(o.Bucket) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		_, oldBlobID = ov.getObject(o.Bucket, o.Key)
+		return []record{{Op: opPutObject, Object: &o}}, nil
+	})
+	if err != nil {
 		return "", err
 	}
-	return old, nil
+	return oldBlobID, nil
 }
 
 // DeleteObject removes an object record and returns its blob ID. Deleting a
 // missing object succeeds and returns an empty string.
 func (s *Store) DeleteObject(bucket, key string) (blobID string, err error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	b := s.buckets[bucket]
-	if b == nil {
-		return "", domain.ErrNoSuchBucket
-	}
-	o, ok := b.objects[key]
-	if !ok {
-		return "", nil
-	}
-	err = s.commit(record{Op: opDeleteObject, Object: &domain.Object{Bucket: bucket, Key: key}})
+	err = s.submit(func(ov *batchOverlay) ([]record, error) {
+		if !ov.hasBucket(bucket) {
+			return nil, domain.ErrNoSuchBucket
+		}
+		exists, old := ov.getObject(bucket, key)
+		if !exists {
+			return nil, nil
+		}
+		blobID = old
+		return []record{{Op: opDeleteObject, Object: &domain.Object{Bucket: bucket, Key: key}}}, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	return o.BlobID, nil
+	return blobID, nil
 }
 
 // HasBucket reports whether a bucket exists.
