@@ -12,9 +12,7 @@ There are two key ideas:
 - **Metadata decides what is visible.** A new object appears only after its journal record is synced and applied in memory.
 
 ## Architecture
-![Architecture](image.png)
-
-&#91;embedded content: GoStore architecture\]
+![Architecture](image-2.png)
 
 Requests flow downward. `internal/domain` holds shared types and validation, `internal/config` loads settings, and `cmd/server` connects everything.
 
