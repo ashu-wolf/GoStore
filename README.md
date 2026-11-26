@@ -1,18 +1,22 @@
 # GoStore
 
-An S3-compatible object storage service in Go. **Work in progress:** only the server setup and health check exist so far.
+An S3-compatible object storage service in Go. **Work in progress.**
 
-## Run (Windows PowerShell)
+Done so far: server setup and health check, core types and validation, and a streaming blob store.
+The blob store is not connected to the HTTP API yet, and there are no S3 operations yet.
 
-    go run ./cmd/server
+## Requirements
 
-In a second terminal:
+Linux, or WSL 2 on Windows. Storage relies on Linux filesystem behavior.
 
-    curl.exe -i http://127.0.0.1:9000/-/healthz
+## Run
+
+    make run
+    curl http://127.0.0.1:9000/-/healthz
 
 ## Check
 
-    powershell -ExecutionPolicy Bypass -File .\check.ps1
+    make check
 
 ## Configuration
 
