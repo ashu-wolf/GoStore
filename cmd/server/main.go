@@ -54,6 +54,9 @@ func run(log *slog.Logger) error {
 		Handler: server.New(log, engine, server.Options{
 			MaxObjectSize: cfg.MaxObjectSize,
 			MaxListKeys:   cfg.ListPageSize,
+			AccessKey:     cfg.AccessKey,
+			SecretKey:     cfg.SecretKey,
+			Region:        cfg.Region,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,

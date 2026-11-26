@@ -14,3 +14,13 @@ jobs:
         run: go vet ./...
       - name: Race tests
         run: go test -race ./...
+      - name: Install pinned AWS CLI v2
+        env:
+          AWSCLI_VERSION: "2.42.4"
+        run: |
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp/awscli
+          sudo /tmp/awscli/aws/install
+          aws --version
+      - name: AWS CLI compatibility check
+        run: bash ./scripts/aws_cli_check.sh

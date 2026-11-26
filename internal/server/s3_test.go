@@ -402,7 +402,7 @@ func TestUnsupportedOperationsRejectedHTTP(t *testing.T) {
 		{"upload part query", http.MethodPut, "/photos/keep.txt?partNumber=1&uploadId=u1", nil},
 		{"object tagging put", http.MethodPut, "/photos/keep.txt?tagging", nil},
 		{"copy object header", http.MethodPut, "/photos/keep.txt", map[string]string{"X-Amz-Copy-Source": "/photos/other"}},
-		{"streaming payload", http.MethodPut, "/photos/keep.txt", map[string]string{"X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}},
+		{"streaming payload", http.MethodPut, "/photos/keep.txt", map[string]string{"X-Amz-Content-Sha256": "STREAMING-UNKNOWN"}},
 		{"initiate multipart", http.MethodPost, "/photos/keep.txt?uploads", nil},
 		{"complete multipart", http.MethodPost, "/photos/keep.txt?uploadId=u1", nil},
 		{"abort multipart", http.MethodDelete, "/photos/keep.txt?uploadId=u1", nil},
@@ -501,7 +501,7 @@ func TestCorruptedBlobAbortsFullDownload(t *testing.T) {
 
 		var logs syncBuffer
 		log := slog.New(slog.NewTextHandler(&logs, nil))
-		ts := httptest.NewServer(New(log, engine))
+		ts := httptest.NewServer(New(log, engine, Options{AllowUnauthenticated: true}))
 		defer ts.Close()
 
 		doReq(t, http.MethodPut, ts.URL+"/photos", nil, nil)
@@ -528,7 +528,7 @@ func TestCorruptedBlobAbortsFullDownload(t *testing.T) {
 
 			var logs syncBuffer
 			log := slog.New(slog.NewTextHandler(&logs, nil))
-			ts := httptest.NewServer(New(log, engine))
+			ts := httptest.NewServer(New(log, engine, Options{AllowUnauthenticated: true}))
 
 			data := bytes.Repeat([]byte("abcdefgh"), (200*1024)/8)
 			doReq(t, http.MethodPut, ts.URL+"/photos", nil, nil)

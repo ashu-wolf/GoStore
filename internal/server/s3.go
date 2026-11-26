@@ -22,7 +22,7 @@ import (
 const streamBufSize = 64 * 1024
 
 func (h *handler) handleService(w http.ResponseWriter, r *http.Request) {
-	if len(r.URL.Query()) > 0 {
+	if hasUnsupportedQuery(r.URL.Query()) {
 		h.writeNotImplemented(w, r, "Query parameters are not supported on the service resource.")
 		return
 	}
@@ -51,7 +51,7 @@ func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket st
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
-		if len(q) > 0 {
+		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
 			return
 		}
@@ -63,7 +63,7 @@ func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket st
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodDelete:
-		if len(q) > 0 {
+		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
 			return
 		}
@@ -178,22 +178,26 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
-		if len(q) > 0 || r.Header.Get("X-Amz-Copy-Source") != "" ||
-			strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
+		rawSHA := r.Header.Get("X-Amz-Content-Sha256")
+		unsupportedStreaming := strings.HasPrefix(rawSHA, "STREAMING-") &&
+			rawSHA != payloadChunkedSigned &&
+			rawSHA != payloadChunkedTrailer &&
+			rawSHA != payloadChunkedUnsigned
+		if hasUnsupportedQuery(q) || r.Header.Get("X-Amz-Copy-Source") != "" || unsupportedStreaming {
 			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
 			return
 		}
 		h.handlePutObject(w, r, bucket, key)
 
 	case http.MethodGet, http.MethodHead:
-		if len(q) > 0 {
+		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
 		}
 		h.handleGetOrHeadObject(w, r, bucket, key)
 
 	case http.MethodDelete:
-		if len(q) > 0 {
+		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
 		}
@@ -212,11 +216,6 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 }
 
 func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	if r.ContentLength > h.maxObjectSize {
-		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
-		return
-	}
-
 	var wantMD5 string
 	if rawMD5 := r.Header.Get("Content-MD5"); rawMD5 != "" {
 		sum, err := base64.StdEncoding.DecodeString(rawMD5)
@@ -227,23 +226,61 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		wantMD5 = hex.EncodeToString(sum)
 	}
 
-	var wantSHA256 string
-	if rawSHA := r.Header.Get("X-Amz-Content-Sha256"); rawSHA != "" && rawSHA != "UNSIGNED-PAYLOAD" {
-		if len(rawSHA) != 64 {
-			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-			return
-		}
-		if _, err := hex.DecodeString(rawSHA); err != nil {
-			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-			return
-		}
-		wantSHA256 = rawSHA
-	}
+	auth, authenticated := authFromContext(r)
+	isChunked := authenticated && (auth.payloadMode == payloadChunkedSigned ||
+		auth.payloadMode == payloadChunkedTrailer ||
+		auth.payloadMode == payloadChunkedUnsigned)
 
-	var wantSize *int64
-	if r.ContentLength >= 0 {
-		cl := r.ContentLength
-		wantSize = &cl
+	var (
+		wantSize   *int64
+		wantSHA256 string
+		body       io.Reader = r.Body
+	)
+
+	if isChunked {
+		rawDecoded := r.Header.Get("X-Amz-Decoded-Content-Length")
+		decodedLen, err := strconv.ParseInt(rawDecoded, 10, 64)
+		if err != nil || decodedLen < 0 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-decoded-content-length header.")
+			return
+		}
+		if decodedLen > h.maxObjectSize {
+			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+			return
+		}
+		wantSize = &decodedLen
+		chunked, err := newAWSChunkedReader(r.Body, auth, parseExpectedTrailers(r.Header))
+		if err != nil {
+			h.writeMappedError(w, r, err)
+			return
+		}
+		body = chunked
+	} else {
+		if r.ContentLength > h.maxObjectSize {
+			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+			return
+		}
+		if r.ContentLength >= 0 {
+			cl := r.ContentLength
+			wantSize = &cl
+		}
+		if rawSHA := r.Header.Get("X-Amz-Content-Sha256"); rawSHA != "" && rawSHA != payloadUnsigned {
+			if len(rawSHA) != 64 {
+				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
+				return
+			}
+			if _, err := hex.DecodeString(rawSHA); err != nil {
+				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
+				return
+			}
+			wantSHA256 = rawSHA
+		}
+		wrapped, err := wrapHeaderChecksums(r.Body, r.Header)
+		if err != nil {
+			h.writeMappedError(w, r, err)
+			return
+		}
+		body = wrapped
 	}
 
 	ct := r.Header.Get("Content-Type")
@@ -262,7 +299,7 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 			WantMD5:    wantMD5,
 			WantSHA256: wantSHA256,
 		},
-	}, r.Body)
+	}, body)
 	if err != nil {
 		h.writeMappedError(w, r, err)
 		return
@@ -431,6 +468,9 @@ func extractMetadata(hdr http.Header) map[string]string {
 
 func hasUnsupportedQuery(q url.Values, allowed ...string) bool {
 	for k := range q {
+		if k == "x-id" {
+			continue
+		}
 		ok := false
 		for _, a := range allowed {
 			if k == a {
@@ -482,6 +522,12 @@ func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err e
 			return
 		}
 		h.writeError(w, r, http.StatusBadRequest, "BadDigest", "The Content-MD5 you specified did not match what we received.")
+	case errors.Is(err, errChunkSignature):
+		h.writeError(w, r, http.StatusForbidden, "SignatureDoesNotMatch", "The chunk signature we calculated does not match the signature you provided.")
+	case errors.Is(err, errTrailerDigest):
+		h.writeError(w, r, http.StatusBadRequest, "BadDigest", err.Error())
+	case errors.Is(err, errChunkMalformed):
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", err.Error())
 	case errors.Is(err, storage.ErrDamaged):
 		h.log.Error("damaged object", "path", r.URL.Path, "error", err)
 		h.writeError(w, r, http.StatusInternalServerError, "InternalError", "Stored object is damaged.")

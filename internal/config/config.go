@@ -21,6 +21,9 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	MaxObjectSize   int64
 	ListPageSize    int
+	AccessKey       string
+	SecretKey       string
+	Region          string
 }
 
 // Load reads the settings and applies defaults.
@@ -30,6 +33,15 @@ func Load() (Config, error) {
 		DataDir:       env("GOSTORE_DATA_DIR", "./data"),
 		MaxObjectSize: defaultMaxObjectSize,
 		ListPageSize:  domain.DefaultMaxKeys,
+		AccessKey:     os.Getenv("GOSTORE_ACCESS_KEY"),
+		SecretKey:     os.Getenv("GOSTORE_SECRET_KEY"),
+		Region:        env("GOSTORE_REGION", "us-east-1"),
+	}
+	if cfg.AccessKey == "" {
+		return Config{}, fmt.Errorf("GOSTORE_ACCESS_KEY is required")
+	}
+	if cfg.SecretKey == "" {
+		return Config{}, fmt.Errorf("GOSTORE_SECRET_KEY is required")
 	}
 	raw := env("GOSTORE_SHUTDOWN_TIMEOUT", "30s")
 	d, err := time.ParseDuration(raw)

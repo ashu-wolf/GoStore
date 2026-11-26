@@ -20,8 +20,15 @@ func newTestServer(t *testing.T, opts ...Options) (*httptest.Server, *storage.En
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Close() })
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.AccessKey == "" && opt.SecretKey == "" {
+		opt.AllowUnauthenticated = true
+	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ts := httptest.NewServer(New(log, engine, opts...))
+	ts := httptest.NewServer(New(log, engine, opt))
 	t.Cleanup(ts.Close)
 	return ts, engine, dir
 }

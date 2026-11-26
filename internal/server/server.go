@@ -18,14 +18,26 @@ import (
 	"github.com/ashu-wolf/gostore/internal/storage"
 )
 
-const defaultMaxObjectSize = int64(1 << 30) // 1 GiB
+const (
+	defaultMaxObjectSize = int64(1 << 30) // 1 GiB
+	defaultRegion        = "us-east-1"
+)
 
-type requestIDKey struct{}
+type (
+	requestIDKey  struct{}
+	authResultKey struct{}
+)
 
 // Options configures the HTTP handler. Zero fields use defaults.
 type Options struct {
-	MaxObjectSize int64
-	MaxListKeys   int
+	MaxObjectSize        int64
+	MaxListKeys          int
+	AccessKey            string
+	SecretKey            string
+	Region               string
+	ClockSkew            time.Duration
+	Now                  func() time.Time
+	AllowUnauthenticated bool
 }
 
 type handler struct {
@@ -33,6 +45,8 @@ type handler struct {
 	store         *storage.Engine
 	maxObjectSize int64
 	maxListKeys   int
+	allowUnauth   bool
+	authCfg       sigV4Config
 }
 
 // New returns the application's HTTP handler.
@@ -48,11 +62,29 @@ func New(log *slog.Logger, store *storage.Engine, opts ...Options) http.Handler 
 	if opt.MaxListKeys <= 0 || opt.MaxListKeys > domain.DefaultMaxKeys {
 		opt.MaxListKeys = domain.DefaultMaxKeys
 	}
+	if opt.Region == "" {
+		opt.Region = defaultRegion
+	}
+	if opt.ClockSkew <= 0 {
+		opt.ClockSkew = defaultClockSkew
+	}
+	if opt.Now == nil {
+		opt.Now = time.Now
+	}
 	h := &handler{
 		log:           log,
 		store:         store,
 		maxObjectSize: opt.MaxObjectSize,
 		maxListKeys:   opt.MaxListKeys,
+		allowUnauth:   opt.AllowUnauthenticated,
+		authCfg: sigV4Config{
+			accessKey: opt.AccessKey,
+			secretKey: opt.SecretKey,
+			region:    opt.Region,
+			service:   "s3",
+			clockSkew: opt.ClockSkew,
+			now:       opt.Now,
+		},
 	}
 	return withRequestLog(log, h)
 }
@@ -73,6 +105,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if raw == "-" || strings.HasPrefix(raw, "-/") {
 		http.NotFound(w, r)
 		return
+	}
+
+	if !h.allowUnauth {
+		auth, authErr := verifySigV4(r, h.authCfg)
+		if authErr != nil {
+			h.writeError(w, r, authErr.status, authErr.code, authErr.message)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), authResultKey{}, auth))
 	}
 
 	if raw == "" {
@@ -118,6 +159,11 @@ func requestID(r *http.Request) string {
 		return id
 	}
 	return ""
+}
+
+func authFromContext(r *http.Request) (authResult, bool) {
+	a, ok := r.Context().Value(authResultKey{}).(authResult)
+	return a, ok
 }
 
 func newRequestID() string {
