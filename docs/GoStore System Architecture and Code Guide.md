@@ -12,6 +12,7 @@ There are two key ideas:
 - **Metadata decides what is visible.** A new object appears only after its journal record is synced and applied in memory.
 
 ## Architecture
+![Architecture](image.png)
 
 &#91;embedded content: GoStore architecture\]
 
@@ -66,7 +67,8 @@ Every S3 request passes the same gates before reaching storage.
 
 ### Upload (PutObject)
 
-&#91;embedded content: PutObject write path\]
+
+![PutObject](image-1.png)
 
 No metadata lock is held while the body streams. The commit checks again that the bucket still exists.
 
