@@ -3,8 +3,8 @@
 An S3-compatible object storage service in Go. **Work in progress.**
 
 Done so far: server setup and health check, core types and validation, a streaming blob store,
-a metadata journal, startup recovery, and bucket/object operations including listing.
-There are no S3 operations over HTTP yet.
+a metadata journal, startup recovery, bucket/object operations including listing, and the
+path-style S3 HTTP API (without Signature V4 authentication or multipart upload yet).
 
 ## Requirements
 
@@ -26,6 +26,8 @@ Linux, or WSL 2 on Windows. Storage relies on Linux filesystem behavior.
 | `GOSTORE_ADDR` | `127.0.0.1:9000` |
 | `GOSTORE_DATA_DIR` | `./data` |
 | `GOSTORE_SHUTDOWN_TIMEOUT` | `30s` |
+| `GOSTORE_MAX_OBJECT_SIZE` | `1073741824` (1 GiB) |
+| `GOSTORE_LIST_PAGE_SIZE` | `1000` |
 
 ## Durability
 

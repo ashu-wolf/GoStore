@@ -1,0 +1,505 @@
+//go:build linux
+
+package server
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/ashu-wolf/gostore/internal/blob"
+	"github.com/ashu-wolf/gostore/internal/domain"
+	"github.com/ashu-wolf/gostore/internal/storage"
+)
+
+const streamBufSize = 64 * 1024
+
+func (h *handler) handleService(w http.ResponseWriter, r *http.Request) {
+	if len(r.URL.Query()) > 0 {
+		h.writeNotImplemented(w, r, "Query parameters are not supported on the service resource.")
+		return
+	}
+	if r.Method != http.MethodGet {
+		h.writeMethodNotAllowed(w, r)
+		return
+	}
+	buckets := h.store.ListBuckets()
+	out := make([]bucketXML, len(buckets))
+	for i, b := range buckets {
+		out[i] = bucketXML{
+			Name:         b.Name,
+			CreationDate: b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		}
+	}
+	writeXML(w, http.StatusOK, listAllMyBucketsXML{
+		Xmlns: s3XMLNS,
+		Owner: ownerXML{ID: "gostore", DisplayName: "gostore"},
+		Buckets: bucketsXML{
+			Bucket: out,
+		},
+	})
+}
+
+func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	q := r.URL.Query()
+	switch r.Method {
+	case http.MethodPut:
+		if len(q) > 0 {
+			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
+			return
+		}
+		if err := h.store.CreateBucket(bucket); err != nil {
+			h.writeMappedError(w, r, err)
+			return
+		}
+		w.Header().Set("Location", "/"+bucket)
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodDelete:
+		if len(q) > 0 {
+			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
+			return
+		}
+		if err := h.store.DeleteBucket(bucket); err != nil {
+			h.writeMappedError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodGet:
+		if hasUnsupportedQuery(q, "list-type", "prefix", "delimiter", "max-keys", "continuation-token", "start-after", "encoding-type", "fetch-owner") {
+			h.writeNotImplemented(w, r, "The requested bucket operation is not supported.")
+			return
+		}
+		switch q.Get("list-type") {
+		case "", "1":
+			h.writeNotImplemented(w, r, "Only ListObjectsV2 (list-type=2) is supported.")
+			return
+		case "2":
+			h.handleListObjectsV2(w, r, bucket, q)
+		default:
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid list-type parameter.")
+		}
+
+	case http.MethodPost:
+		h.writeNotImplemented(w, r, "The requested bucket operation is not supported.")
+
+	default:
+		h.writeMethodNotAllowed(w, r)
+	}
+}
+
+func (h *handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
+	encodingType := q.Get("encoding-type")
+	if encodingType != "" && encodingType != "url" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid encoding-type parameter.")
+		return
+	}
+
+	maxKeys := h.maxListKeys
+	zeroMax := false
+	if rawMax := q.Get("max-keys"); rawMax != "" {
+		v, err := strconv.Atoi(rawMax)
+		if err != nil || v < 0 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid max-keys parameter.")
+			return
+		}
+		if v == 0 {
+			zeroMax = true
+			maxKeys = 1 // validate bucket and token, then return zero entries
+		} else if v < maxKeys {
+			maxKeys = v
+		}
+	}
+
+	opts := domain.ListOptions{
+		Bucket:            bucket,
+		Prefix:            q.Get("prefix"),
+		Delimiter:         q.Get("delimiter"),
+		MaxKeys:           maxKeys,
+		ContinuationToken: q.Get("continuation-token"),
+		StartAfter:        q.Get("start-after"),
+	}
+	res, err := h.store.ListObjects(opts)
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	if zeroMax {
+		res = domain.ListResult{}
+		maxKeys = 0
+	}
+
+	encode := func(s string) string { return s }
+	if encodingType == "url" {
+		encode = url.QueryEscape
+	}
+
+	contents := make([]objectXML, len(res.Objects))
+	for i, o := range res.Objects {
+		contents[i] = objectXML{
+			Key:          encode(o.Key),
+			LastModified: o.ModifiedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + o.ETag + `"`,
+			Size:         o.Size,
+			StorageClass: "STANDARD",
+		}
+	}
+	prefixes := make([]commonPrefixXML, len(res.CommonPrefixes))
+	for i, p := range res.CommonPrefixes {
+		prefixes[i] = commonPrefixXML{Prefix: encode(p)}
+	}
+
+	writeXML(w, http.StatusOK, listBucketResultXML{
+		Xmlns:                 s3XMLNS,
+		Name:                  bucket,
+		Prefix:                encode(opts.Prefix),
+		KeyCount:              len(contents) + len(prefixes),
+		MaxKeys:               maxKeys,
+		Delimiter:             encode(opts.Delimiter),
+		IsTruncated:           res.IsTruncated,
+		ContinuationToken:     opts.ContinuationToken,
+		NextContinuationToken: res.NextContinuationToken,
+		StartAfter:            encode(opts.StartAfter),
+		EncodingType:          encodingType,
+		Contents:              contents,
+		CommonPrefixes:        prefixes,
+	})
+}
+
+func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	q := r.URL.Query()
+	switch r.Method {
+	case http.MethodPut:
+		if len(q) > 0 || r.Header.Get("X-Amz-Copy-Source") != "" ||
+			strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
+			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
+			return
+		}
+		h.handlePutObject(w, r, bucket, key)
+
+	case http.MethodGet, http.MethodHead:
+		if len(q) > 0 {
+			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
+			return
+		}
+		h.handleGetOrHeadObject(w, r, bucket, key)
+
+	case http.MethodDelete:
+		if len(q) > 0 {
+			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
+			return
+		}
+		if err := h.store.DeleteObject(bucket, key); err != nil {
+			h.writeMappedError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodPost:
+		h.writeNotImplemented(w, r, "The requested object operation is not supported.")
+
+	default:
+		h.writeMethodNotAllowed(w, r)
+	}
+}
+
+func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if r.ContentLength > h.maxObjectSize {
+		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+		return
+	}
+
+	var wantMD5 string
+	if rawMD5 := r.Header.Get("Content-MD5"); rawMD5 != "" {
+		sum, err := base64.StdEncoding.DecodeString(rawMD5)
+		if err != nil || len(sum) != 16 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidDigest", "The Content-MD5 you specified was invalid.")
+			return
+		}
+		wantMD5 = hex.EncodeToString(sum)
+	}
+
+	var wantSHA256 string
+	if rawSHA := r.Header.Get("X-Amz-Content-Sha256"); rawSHA != "" && rawSHA != "UNSIGNED-PAYLOAD" {
+		if len(rawSHA) != 64 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
+			return
+		}
+		if _, err := hex.DecodeString(rawSHA); err != nil {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
+			return
+		}
+		wantSHA256 = rawSHA
+	}
+
+	var wantSize *int64
+	if r.ContentLength >= 0 {
+		cl := r.ContentLength
+		wantSize = &cl
+	}
+
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+
+	obj, err := h.store.PutObject(r.Context(), storage.PutRequest{
+		Bucket:      bucket,
+		Key:         key,
+		ContentType: ct,
+		Metadata:    extractMetadata(r.Header),
+		Checks: blob.PutOptions{
+			MaxSize:    h.maxObjectSize,
+			WantSize:   wantSize,
+			WantMD5:    wantMD5,
+			WantSHA256: wantSHA256,
+		},
+	}, r.Body)
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", `"`+obj.ETag+`"`)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	var (
+		obj domain.Object
+		rdr io.ReadSeekCloser
+		err error
+	)
+	if r.Method == http.MethodHead {
+		obj, err = h.store.HeadObject(bucket, key)
+	} else {
+		obj, rdr, err = h.store.OpenObject(bucket, key)
+	}
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	if rdr != nil {
+		defer rdr.Close()
+	}
+
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+		br, err := parseByteRange(rangeHdr, obj.Size)
+		if err != nil {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", obj.Size))
+			h.writeError(w, r, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "The requested range is not satisfiable.")
+			return
+		}
+		writeObjectHeaders(w, obj, br.length())
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", br.start, br.end, obj.Size))
+		w.WriteHeader(http.StatusPartialContent)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if _, err := rdr.Seek(br.start, io.SeekStart); err != nil {
+			h.log.Error("range seek failed", "bucket", bucket, "key", key, "error", err)
+			abortConnection(w)
+			return
+		}
+		if _, err := io.CopyN(w, rdr, br.length()); err != nil {
+			h.log.Error("range read failed", "bucket", bucket, "key", key, "error", err)
+			abortConnection(w)
+		}
+		return
+	}
+
+	if r.Method == http.MethodHead {
+		writeObjectHeaders(w, obj, obj.Size)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	headersSent, integrityErr, writeErr := streamVerified(w, rdr, obj.Size, obj.SHA256, func() {
+		writeObjectHeaders(w, obj, obj.Size)
+		w.WriteHeader(http.StatusOK)
+	})
+	if writeErr != nil {
+		return
+	}
+	if integrityErr != nil {
+		h.log.Error("corrupted object read", "bucket", bucket, "key", key, "error", integrityErr)
+		if !headersSent {
+			h.writeError(w, r, http.StatusInternalServerError, "InternalError", "Stored object failed integrity check.")
+			return
+		}
+		abortConnection(w)
+	}
+}
+
+// streamVerified streams r to w while verifying size and SHA-256. The final
+// chunk is held back until EOF and checksum verification succeed.
+func streamVerified(w http.ResponseWriter, r io.Reader, wantSize int64, wantSHA256 string, sendHeaders func()) (headersSent bool, integrityErr error, writeErr error) {
+	curr := make([]byte, streamBufSize)
+	prev := make([]byte, streamBufSize)
+	prevLen := 0
+	var total int64
+	sum := sha256.New()
+
+	for {
+		n, readErr := r.Read(curr)
+		if n > 0 {
+			_, _ = sum.Write(curr[:n])
+			total += int64(n)
+			if total > wantSize {
+				return headersSent, fmt.Errorf("blob size %d exceeds metadata size %d", total, wantSize), nil
+			}
+			if prevLen > 0 {
+				if !headersSent {
+					sendHeaders()
+					headersSent = true
+				}
+				if _, err := w.Write(prev[:prevLen]); err != nil {
+					return headersSent, nil, err
+				}
+			}
+			prev, curr = curr, prev
+			prevLen = n
+		}
+		if readErr == io.EOF {
+			if total != wantSize {
+				return headersSent, fmt.Errorf("blob size %d does not match metadata size %d", total, wantSize), nil
+			}
+			gotSHA := hex.EncodeToString(sum.Sum(nil))
+			if !strings.EqualFold(gotSHA, wantSHA256) {
+				return headersSent, fmt.Errorf("SHA-256 mismatch: got %s, want %s", gotSHA, wantSHA256), nil
+			}
+			if !headersSent {
+				sendHeaders()
+				headersSent = true
+			}
+			if prevLen > 0 {
+				if _, err := w.Write(prev[:prevLen]); err != nil {
+					return headersSent, nil, err
+				}
+			}
+			return headersSent, nil, nil
+		}
+		if readErr != nil {
+			return headersSent, fmt.Errorf("read blob: %w", readErr), nil
+		}
+	}
+}
+
+func abortConnection(w http.ResponseWriter) {
+	if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+		_ = conn.Close()
+		return
+	}
+	panic(http.ErrAbortHandler)
+}
+
+func writeObjectHeaders(w http.ResponseWriter, obj domain.Object, contentLength int64) {
+	ct := obj.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Last-Modified", obj.ModifiedAt.UTC().Format(http.TimeFormat))
+	w.Header().Set("ETag", `"`+obj.ETag+`"`)
+	w.Header().Set("Accept-Ranges", "bytes")
+	for k, v := range obj.Metadata {
+		w.Header().Set("X-Amz-Meta-"+k, v)
+	}
+}
+
+func extractMetadata(hdr http.Header) map[string]string {
+	var out map[string]string
+	for k, vals := range hdr {
+		lower := strings.ToLower(k)
+		if name, ok := strings.CutPrefix(lower, "x-amz-meta-"); ok {
+			if out == nil {
+				out = make(map[string]string)
+			}
+			out[name] = strings.Join(vals, ",")
+		}
+	}
+	return out
+}
+
+func hasUnsupportedQuery(q url.Values, allowed ...string) bool {
+	for k := range q {
+		ok := false
+		for _, a := range allowed {
+			if k == a {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *handler) writeNotImplemented(w http.ResponseWriter, r *http.Request, msg string) {
+	h.writeError(w, r, http.StatusNotImplemented, "NotImplemented", msg)
+}
+
+func (h *handler) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	h.writeError(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+}
+
+func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidBucketName):
+		h.writeError(w, r, http.StatusBadRequest, "InvalidBucketName", err.Error())
+	case errors.Is(err, domain.ErrBucketExists):
+		h.writeError(w, r, http.StatusConflict, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it.")
+	case errors.Is(err, domain.ErrNoSuchBucket):
+		h.writeError(w, r, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist.")
+	case errors.Is(err, domain.ErrBucketNotEmpty):
+		h.writeError(w, r, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
+	case errors.Is(err, domain.ErrNoSuchKey):
+		h.writeError(w, r, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+	case errors.Is(err, domain.ErrInvalidKey),
+		errors.Is(err, domain.ErrInvalidMetadata),
+		errors.Is(err, domain.ErrInvalidToken),
+		errors.Is(err, domain.ErrInvalidArgument):
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", err.Error())
+	case errors.Is(err, domain.ErrMetadataTooLarge):
+		h.writeError(w, r, http.StatusBadRequest, "MetadataTooLarge", err.Error())
+	case errors.Is(err, blob.ErrTooLarge):
+		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+	case errors.Is(err, blob.ErrSizeMismatch):
+		h.writeError(w, r, http.StatusBadRequest, "IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+	case errors.Is(err, blob.ErrChecksumMismatch):
+		if strings.Contains(err.Error(), "SHA-256") {
+			h.writeError(w, r, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
+		h.writeError(w, r, http.StatusBadRequest, "BadDigest", "The Content-MD5 you specified did not match what we received.")
+	case errors.Is(err, storage.ErrDamaged):
+		h.log.Error("damaged object", "path", r.URL.Path, "error", err)
+		h.writeError(w, r, http.StatusInternalServerError, "InternalError", "Stored object is damaged.")
+	default:
+		h.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		h.writeError(w, r, http.StatusInternalServerError, "InternalError", "We encountered an internal error. Please try again.")
+	}
+}
+
+func (h *handler) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
+		return
+	}
+	writeXML(w, status, errorXML{
+		Code:      code,
+		Message:   message,
+		Resource:  r.URL.Path,
+		RequestID: requestID(r),
+	})
+}

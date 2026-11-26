@@ -35,8 +35,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}
-	// No handler uses the engine yet. Once they do, it must be closed only
-	// after all of them have returned.
+	// Engine must be closed only after all HTTP handlers have returned.
 	defer func() {
 		if err := engine.Close(); err != nil {
 			log.Error("close storage", "error", err)
@@ -51,8 +50,11 @@ func run(log *slog.Logger) error {
 	)
 
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           server.New(log),
+		Addr: cfg.Addr,
+		Handler: server.New(log, engine, server.Options{
+			MaxObjectSize: cfg.MaxObjectSize,
+			MaxListKeys:   cfg.ListPageSize,
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
