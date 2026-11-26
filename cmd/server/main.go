@@ -14,6 +14,7 @@ import (
 
 	"github.com/ashu-wolf/gostore/internal/config"
 	"github.com/ashu-wolf/gostore/internal/server"
+	"github.com/ashu-wolf/gostore/internal/storage"
 )
 
 func main() {
@@ -29,9 +30,25 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return fmt.Errorf("create data directory: %w", err)
+	// Recovery finishes before the server starts listening.
+	engine, report, err := storage.Open(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("open storage: %w", err)
 	}
+	// No handler uses the engine yet. Once they do, it must be closed only
+	// after all of them have returned.
+	defer func() {
+		if err := engine.Close(); err != nil {
+			log.Error("close storage", "error", err)
+		}
+	}()
+	log.Info("storage recovered",
+		"temp_removed", report.TempRemoved,
+		"orphans_removed", report.OrphansRemoved,
+		"journal_bytes_discarded", report.DiscardedBytes,
+		"journal_compacted", report.Compacted,
+		"damaged_objects", len(report.Damaged),
+	)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

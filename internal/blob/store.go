@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/ashu-wolf/gostore/internal/crashpoint"
 )
 
 const (
@@ -196,12 +198,15 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opts PutOptions) (_ Info, 
 		return Info{}, fmt.Errorf("close blob: %w", err)
 	}
 
+	crashpoint.Hit("blob.before-rename")
+
 	// 4. Publish with an atomic rename, then make the rename durable.
 	final := s.path(id)
 	if err := s.ops.rename(f.Name(), final); err != nil {
 		return Info{}, fmt.Errorf("publish blob: %w", err)
 	}
 	published = true
+	crashpoint.Hit("blob.after-rename")
 	if err := s.ops.syncDir(filepath.Dir(final)); err != nil {
 		_ = os.Remove(final) // best effort; startup cleanup handles leftovers
 		return Info{}, fmt.Errorf("sync blob directory: %w", err)
