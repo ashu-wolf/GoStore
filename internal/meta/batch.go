@@ -43,24 +43,21 @@ func (s *Store) submit(prepare func(ov *batchOverlay) ([]record, error)) error {
 		}
 	}
 
-	for {
-		s.queueMu.Lock()
-		batch := s.pending
-		s.pending = nil
+	s.queueMu.Lock()
+	batch := s.pending
+	s.pending = nil
+	s.queueMu.Unlock()
+
+	s.flushBatch(batch)
+
+	s.queueMu.Lock()
+	if len(s.pending) == 0 {
+		s.flushing = false
 		s.queueMu.Unlock()
-
-		s.flushBatch(batch)
-
-		s.queueMu.Lock()
-		if len(s.pending) == 0 {
-			s.flushing = false
-			s.queueMu.Unlock()
-			break
-		}
+	} else {
 		nextLeader := s.pending[0]
 		s.queueMu.Unlock()
 		close(nextLeader.becomeLeader)
-		break
 	}
 	return <-req.done
 }
