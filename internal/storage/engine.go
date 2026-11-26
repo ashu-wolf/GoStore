@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ashu-wolf/gostore/internal/blob"
 	"github.com/ashu-wolf/gostore/internal/crashpoint"
@@ -22,8 +24,9 @@ var ErrDamaged = errors.New("object data is damaged")
 
 // Engine is safe for concurrent use. Close it only after all calls return.
 type Engine struct {
-	blobs *blob.Store
-	meta  *meta.Store
+	blobs    *blob.Store
+	meta     *meta.Store
+	onLookup func() // test hook called after meta lookup in lookupObject
 }
 
 // Report describes what startup recovery found.
@@ -109,6 +112,11 @@ func (e *Engine) DeleteBucket(name string) error {
 	return e.meta.DeleteBucket(name)
 }
 
+// ListBuckets returns all buckets sorted by name.
+func (e *Engine) ListBuckets() []domain.Bucket {
+	return e.meta.ListBuckets()
+}
+
 // PutRequest describes an object upload.
 type PutRequest struct {
 	Bucket      string
@@ -167,33 +175,118 @@ func (e *Engine) PutObject(ctx context.Context, req PutRequest, body io.Reader) 
 	return obj, nil
 }
 
+// HeadObject returns an object's metadata after verifying that its blob
+// exists and has the expected size.
+func (e *Engine) HeadObject(bucket, key string) (domain.Object, error) {
+	obj, _, err := lookupObject(e, bucket, key, func(obj domain.Object) (struct{}, error) {
+		size, err := e.blobs.Size(obj.BlobID)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if size != obj.Size {
+			return struct{}{}, ErrDamaged
+		}
+		return struct{}{}, nil
+	})
+	return obj, err
+}
+
 // OpenObject returns an object's record and data. The caller must close the
 // reader. The data is not checked against its SHA-256 here.
 func (e *Engine) OpenObject(bucket, key string) (domain.Object, io.ReadSeekCloser, error) {
+	return lookupObject(e, bucket, key, func(obj domain.Object) (io.ReadSeekCloser, error) {
+		r, err := e.blobs.Open(obj.BlobID)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkSize(r, obj.Size); err != nil {
+			_ = r.Close()
+			return nil, err
+		}
+		return r, nil
+	})
+}
+
+func lookupObject[T any](e *Engine, bucket, key string, access func(domain.Object) (T, error)) (domain.Object, T, error) {
 	tried := ""
 	for {
 		obj, err := e.meta.Object(bucket, key)
 		if err != nil {
-			return domain.Object{}, nil, err
+			var zero T
+			return domain.Object{}, zero, err
 		}
 		if obj.BlobID == tried {
-			return domain.Object{}, nil, ErrDamaged
+			var zero T
+			return domain.Object{}, zero, ErrDamaged
 		}
-		r, err := e.blobs.Open(obj.BlobID)
+		if e.onLookup != nil {
+			e.onLookup()
+		}
+		val, err := access(obj)
 		if errors.Is(err, blob.ErrNotFound) {
 			// The object may have been replaced after the lookup. Look again.
 			tried = obj.BlobID
 			continue
 		}
 		if err != nil {
-			return domain.Object{}, nil, err
+			var zero T
+			return domain.Object{}, zero, err
 		}
-		if err := checkSize(r, obj.Size); err != nil {
-			_ = r.Close()
-			return domain.Object{}, nil, err
-		}
-		return obj, r, nil
+		return obj, val, nil
 	}
+}
+
+// ListObjects returns a page of objects and common prefixes in UTF-8 byte order.
+func (e *Engine) ListObjects(opts domain.ListOptions) (domain.ListResult, error) {
+	if !utf8.ValidString(opts.Prefix) {
+		return domain.ListResult{}, fmt.Errorf("%w: prefix is not valid UTF-8", domain.ErrInvalidArgument)
+	}
+	if !utf8.ValidString(opts.Delimiter) {
+		return domain.ListResult{}, fmt.Errorf("%w: delimiter is not valid UTF-8", domain.ErrInvalidArgument)
+	}
+	if opts.MaxKeys < 0 {
+		return domain.ListResult{}, fmt.Errorf("%w: max keys must not be negative", domain.ErrInvalidArgument)
+	}
+	maxKeys := opts.MaxKeys
+	if maxKeys == 0 || maxKeys > domain.DefaultMaxKeys {
+		maxKeys = domain.DefaultMaxKeys
+	}
+
+	var after string
+	var afterIsPrefix bool
+	if opts.ContinuationToken != "" {
+		tok, err := domain.DecodeListToken(opts.ContinuationToken, opts.Bucket, opts.Prefix, opts.Delimiter)
+		if err != nil {
+			return domain.ListResult{}, err
+		}
+		after = tok.After
+		afterIsPrefix = opts.Delimiter != "" && strings.Contains(tok.After[len(opts.Prefix):], opts.Delimiter)
+	} else if opts.StartAfter != "" {
+		after = opts.StartAfter
+	}
+
+	page, err := e.meta.ListObjects(opts.Bucket, opts.Prefix, opts.Delimiter, after, afterIsPrefix, maxKeys)
+	if err != nil {
+		return domain.ListResult{}, err
+	}
+	res := domain.ListResult{
+		Objects:        page.Objects,
+		CommonPrefixes: page.CommonPrefixes,
+		IsTruncated:    page.Truncated,
+	}
+	if page.Truncated {
+		tok, err := (domain.ListToken{
+			Bucket:    opts.Bucket,
+			Prefix:    opts.Prefix,
+			Delimiter: opts.Delimiter,
+			After:     page.LastItem,
+		}).Encode()
+		if err != nil {
+			return domain.ListResult{}, fmt.Errorf("encode continuation token: %w", err)
+		}
+		res.NextContinuationToken = tok
+	}
+	return res, nil
 }
 
 func checkSize(r io.Seeker, want int64) error {

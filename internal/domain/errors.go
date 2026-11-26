@@ -10,6 +10,7 @@ var (
 	ErrInvalidMetadata   = errors.New("invalid metadata")
 	ErrMetadataTooLarge  = errors.New("metadata too large")
 	ErrInvalidToken      = errors.New("invalid continuation token")
+	ErrInvalidArgument   = errors.New("invalid argument")
 
 	ErrBucketExists   = errors.New("bucket already exists")
 	ErrBucketNotEmpty = errors.New("bucket not empty")

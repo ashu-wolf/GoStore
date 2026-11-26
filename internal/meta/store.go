@@ -18,6 +18,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/ashu-wolf/gostore/internal/crashpoint"
@@ -40,6 +41,7 @@ const compactSlack = 1000
 type bucketState struct {
 	info    domain.Bucket
 	objects map[string]domain.Object
+	keys    []string // sorted in UTF-8 byte order
 }
 
 type journalFile interface {
@@ -164,9 +166,18 @@ func (s *Store) apply(r record) error {
 			return domain.ErrNoSuchBucket
 		}
 		if r.Op == opPutObject {
+			if _, exists := b.objects[r.Object.Key]; !exists {
+				i, _ := slices.BinarySearch(b.keys, r.Object.Key)
+				b.keys = slices.Insert(b.keys, i, r.Object.Key)
+			}
 			b.objects[r.Object.Key] = *r.Object
 		} else {
-			delete(b.objects, r.Object.Key)
+			if _, exists := b.objects[r.Object.Key]; exists {
+				if i, found := slices.BinarySearch(b.keys, r.Object.Key); found {
+					b.keys = slices.Delete(b.keys, i, i+1)
+				}
+				delete(b.objects, r.Object.Key)
+			}
 		}
 	default:
 		return fmt.Errorf("unknown record %q", r.Op)
@@ -180,7 +191,7 @@ func (s *Store) snapshot() []record {
 	for _, name := range slices.Sorted(maps.Keys(s.buckets)) {
 		b := s.buckets[name]
 		out = append(out, record{Op: opCreateBucket, Bucket: &b.info})
-		for _, key := range slices.Sorted(maps.Keys(b.objects)) {
+		for _, key := range b.keys {
 			o := b.objects[key]
 			out = append(out, record{Op: opPutObject, Object: &o})
 		}
@@ -287,4 +298,124 @@ func (s *Store) AllObjects() []domain.Object {
 		}
 	}
 	return out
+}
+
+// ListBuckets returns all buckets sorted by name.
+func (s *Store) ListBuckets() []domain.Bucket {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]domain.Bucket, 0, len(s.buckets))
+	for _, b := range s.buckets {
+		out = append(out, b.info)
+	}
+	slices.SortFunc(out, func(a, b domain.Bucket) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out
+}
+
+// ListPage holds one page of a bucket listing from metadata.
+type ListPage struct {
+	Objects        []domain.Object
+	CommonPrefixes []string
+	LastItem       string
+	Truncated      bool
+}
+
+// ListObjects lists up to maxKeys entries (objects and common prefixes) in
+// UTF-8 byte order by seeking into the sorted key index.
+func (s *Store) ListObjects(bucket, prefix, delimiter, after string, afterIsPrefix bool, maxKeys int) (ListPage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b := s.buckets[bucket]
+	if b == nil {
+		return ListPage{}, domain.ErrNoSuchBucket
+	}
+	if maxKeys <= 0 || len(b.keys) == 0 {
+		return ListPage{}, nil
+	}
+
+	i, ok := startAt(b.keys, prefix, after, afterIsPrefix)
+	if !ok {
+		return ListPage{}, nil
+	}
+
+	var page ListPage
+	count := 0
+	for i < len(b.keys) {
+		key := b.keys[i]
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			break
+		}
+
+		if delimiter != "" {
+			rest := key[len(prefix):]
+			if sep := strings.Index(rest, delimiter); sep >= 0 {
+				cp := key[:len(prefix)+sep+len(delimiter)]
+				if count == maxKeys {
+					page.Truncated = true
+					break
+				}
+				page.CommonPrefixes = append(page.CommonPrefixes, cp)
+				page.LastItem = cp
+				count++
+
+				end, hasEnd := nextPrefix(cp)
+				if !hasEnd {
+					break
+				}
+				nextIdx, _ := slices.BinarySearch(b.keys[i+1:], end)
+				i = i + 1 + nextIdx
+				continue
+			}
+		}
+
+		if count == maxKeys {
+			page.Truncated = true
+			break
+		}
+		obj := b.objects[key]
+		obj.Metadata = maps.Clone(obj.Metadata)
+		page.Objects = append(page.Objects, obj)
+		page.LastItem = key
+		count++
+		i++
+	}
+	if !page.Truncated {
+		page.LastItem = ""
+	}
+	return page, nil
+}
+
+func startAt(keys []string, prefix, after string, afterIsPrefix bool) (int, bool) {
+	if after == "" || after < prefix {
+		i, _ := slices.BinarySearch(keys, prefix)
+		return i, true
+	}
+	if afterIsPrefix {
+		end, ok := nextPrefix(after)
+		if !ok {
+			return 0, false
+		}
+		i, _ := slices.BinarySearch(keys, end)
+		return i, true
+	}
+	i, found := slices.BinarySearch(keys, after)
+	if found {
+		i++
+	}
+	return i, true
+}
+
+// nextPrefix returns the smallest string strictly greater than every string
+// starting with p, or ("", false) when p consists only of 0xff bytes.
+func nextPrefix(p string) (string, bool) {
+	b := []byte(p)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xff {
+			b[i]++
+			return string(b[:i+1]), true
+		}
+	}
+	return "", false
 }

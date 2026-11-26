@@ -44,3 +44,24 @@ type Part struct {
 	ETag       string
 	ModifiedAt time.Time
 }
+
+// DefaultMaxKeys is the default page size for object listings.
+const DefaultMaxKeys = 1000
+
+// ListOptions controls a bucket object listing.
+type ListOptions struct {
+	Bucket            string
+	Prefix            string
+	Delimiter         string
+	MaxKeys           int
+	ContinuationToken string
+	StartAfter        string
+}
+
+// ListResult is one page of objects and common prefixes from a bucket listing.
+type ListResult struct {
+	Objects               []Object
+	CommonPrefixes        []string
+	IsTruncated           bool
+	NextContinuationToken string
+}

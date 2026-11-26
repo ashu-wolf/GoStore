@@ -3,6 +3,7 @@ package domain
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 )
 
 const maxTokenLength = 16 * 1024
@@ -42,7 +43,7 @@ func DecodeListToken(s, bucket, prefix, delimiter string) (ListToken, error) {
 	if t.Bucket != bucket || t.Prefix != prefix || t.Delimiter != delimiter {
 		return ListToken{}, ErrInvalidToken
 	}
-	if ValidateKey(t.After) != nil {
+	if ValidateKey(t.After) != nil || !strings.HasPrefix(t.After, prefix) {
 		return ListToken{}, ErrInvalidToken
 	}
 	return t, nil

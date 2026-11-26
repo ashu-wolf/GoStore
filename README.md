@@ -3,7 +3,8 @@
 An S3-compatible object storage service in Go. **Work in progress.**
 
 Done so far: server setup and health check, core types and validation, a streaming blob store,
-a metadata journal and startup recovery. There are no S3 operations over HTTP yet.
+a metadata journal, startup recovery, and bucket/object operations including listing.
+There are no S3 operations over HTTP yet.
 
 ## Requirements
 

@@ -118,6 +118,10 @@ func TestListToken(t *testing.T) {
 		{"other bucket", s, "videos", "2026/", "/"},
 		{"other prefix", s, "photos", "2025/", "/"},
 		{"other delimiter", s, "photos", "2026/", ""},
+		{"after outside prefix", func() string {
+			badTok, _ := (ListToken{Bucket: "photos", Prefix: "2026/", Delimiter: "/", After: "2025/a.jpg"}).Encode()
+			return badTok
+		}(), "photos", "2026/", "/"},
 	}
 	for _, tt := range bad {
 		t.Run(tt.name, func(t *testing.T) {
