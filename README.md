@@ -145,6 +145,7 @@ make bench
 
 ## Architecture, Durability & Reports
 
+- [docs/system-and-code-guide.md](docs/system-and-code-guide.md) — full system architecture, component breakdown, and package-by-package code walkthrough
 - [docs/architecture.md](docs/architecture.md) — system diagram, write protocol & commit point, read integrity check, and startup recovery
 - [docs/runbook.md](docs/runbook.md) — reverse-proxy TLS, Docker Compose operations, graceful shutdown, and backup/restore
 - [docs/benchmarks.md](docs/benchmarks.md) — baseline and post-group-commit benchmark methodology, environment, and measured results
