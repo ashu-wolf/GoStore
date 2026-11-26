@@ -1,0 +1,25 @@
+services:
+  gostore:
+    build: .
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      GOSTORE_ADDR: ":9000"
+      GOSTORE_DATA_DIR: "/data"
+      GOSTORE_ACCESS_KEY: "${GOSTORE_ACCESS_KEY:?GOSTORE_ACCESS_KEY must be set}"
+      GOSTORE_SECRET_KEY: "${GOSTORE_SECRET_KEY:?GOSTORE_SECRET_KEY must be set}"
+      GOSTORE_REGION: "${GOSTORE_REGION:-us-east-1}"
+      GOSTORE_SHUTDOWN_TIMEOUT: "${GOSTORE_SHUTDOWN_TIMEOUT:-30s}"
+    volumes:
+      - gostore_data:/data
+    stop_grace_period: 35s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/-/readyz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 3s
+
+volumes:
+  gostore_data:

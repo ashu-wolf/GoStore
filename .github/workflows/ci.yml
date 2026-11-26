@@ -24,3 +24,5 @@ jobs:
           aws --version | grep -q "aws-cli/${AWSCLI_VERSION} "
       - name: AWS CLI compatibility check
         run: bash ./scripts/aws_cli_check.sh
+      - name: Container compatibility and persistence check
+        run: bash ./scripts/container_check.sh

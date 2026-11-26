@@ -33,15 +33,22 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("GOSTORE_MIN_FREE_SPACE", "2048")
 	t.Setenv("GOSTORE_LIST_PAGE_SIZE", "25")
 	t.Setenv("GOSTORE_REGION", "eu-west-1")
+	t.Setenv("GOSTORE_PPROF_ADDR", "127.0.0.1:6060")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.MaxObjectSize != 4096 || cfg.MaxMultipartSize != 8192 || cfg.MinPartSize != 512 ||
 		cfg.MaxUploadParts != 20 || cfg.MaxConcurrentRequests != 32 || cfg.MinFreeSpace != 2048 ||
-		cfg.ListPageSize != 25 || cfg.Region != "eu-west-1" {
+		cfg.ListPageSize != 25 || cfg.Region != "eu-west-1" || cfg.PprofAddr != "127.0.0.1:6060" {
 		t.Fatalf("unexpected overrides: %+v", cfg)
 	}
+
+	t.Setenv("GOSTORE_PPROF_ADDR", "0.0.0.0:6060")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for non-localhost pprof address")
+	}
+	t.Setenv("GOSTORE_PPROF_ADDR", "")
 
 	t.Setenv("GOSTORE_MAX_OBJECT_SIZE", "0")
 	if _, err := Load(); err == nil {

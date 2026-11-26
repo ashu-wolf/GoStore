@@ -25,15 +25,18 @@ import (
 
 const streamBufSize = 64 * 1024
 
-func (h *handler) handleService(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleService(w http.ResponseWriter, r *http.Request) {
 	if hasUnsupportedQuery(r.URL.Query()) {
+		setOp(r, "unsupported")
 		h.writeNotImplemented(w, r, "Query parameters are not supported on the service resource.")
 		return
 	}
 	if r.Method != http.MethodGet {
+		setOp(r, "unsupported")
 		h.writeMethodNotAllowed(w, r)
 		return
 	}
+	setOp(r, "list_buckets")
 	buckets := h.store.ListBuckets()
 	out := make([]bucketXML, len(buckets))
 	for i, b := range buckets {
@@ -51,14 +54,16 @@ func (h *handler) handleService(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+func (h *Handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
 			return
 		}
+		setOp(r, "create_bucket")
 		if err := h.store.CreateBucket(bucket); err != nil {
 			h.writeMappedError(w, r, err)
 			return
@@ -68,9 +73,11 @@ func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket st
 
 	case http.MethodDelete:
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Bucket subresource operations are not supported.")
 			return
 		}
+		setOp(r, "delete_bucket")
 		if err := h.store.DeleteBucket(bucket); err != nil {
 			h.writeMappedError(w, r, err)
 			return
@@ -79,28 +86,34 @@ func (h *handler) handleBucket(w http.ResponseWriter, r *http.Request, bucket st
 
 	case http.MethodGet:
 		if hasUnsupportedQuery(q, "list-type", "prefix", "delimiter", "max-keys", "continuation-token", "start-after", "encoding-type", "fetch-owner") {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "The requested bucket operation is not supported.")
 			return
 		}
 		switch q.Get("list-type") {
 		case "", "1":
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Only ListObjectsV2 (list-type=2) is supported.")
 			return
 		case "2":
+			setOp(r, "list_objects_v2")
 			h.handleListObjectsV2(w, r, bucket, q)
 		default:
+			setOp(r, "list_objects_v2")
 			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid list-type parameter.")
 		}
 
 	case http.MethodPost:
+		setOp(r, "unsupported")
 		h.writeNotImplemented(w, r, "The requested bucket operation is not supported.")
 
 	default:
+		setOp(r, "unsupported")
 		h.writeMethodNotAllowed(w, r)
 	}
 }
 
-func (h *handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
+func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
 	encodingType := q.Get("encoding-type")
 	if encodingType != "" && encodingType != "url" {
 		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid encoding-type parameter.")
@@ -178,7 +191,7 @@ func (h *handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bu
 	})
 }
 
-func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (h *Handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
@@ -188,58 +201,73 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 			rawSHA != payloadChunkedTrailer &&
 			rawSHA != payloadChunkedUnsigned
 		if r.Header.Get("X-Amz-Copy-Source") != "" || unsupportedStreaming {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
 			return
 		}
 		if q.Has("partNumber") || q.Has("uploadId") {
 			if hasUnsupportedQuery(q, "partNumber", "uploadId") {
+				setOp(r, "unsupported")
 				h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
 				return
 			}
+			setOp(r, "upload_part")
 			h.handleUploadPart(w, r, bucket, key, q)
 			return
 		}
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
 			return
 		}
+		setOp(r, "put_object")
 		h.handlePutObject(w, r, bucket, key)
 
 	case http.MethodGet:
 		if q.Has("uploadId") {
 			if hasUnsupportedQuery(q, "uploadId", "max-parts", "part-number-marker", "encoding-type") {
+				setOp(r, "unsupported")
 				h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 				return
 			}
+			setOp(r, "list_parts")
 			h.handleListParts(w, r, bucket, key, q)
 			return
 		}
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
 		}
+		setOp(r, "get_object")
 		h.handleGetOrHeadObject(w, r, bucket, key)
 
 	case http.MethodHead:
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
 		}
+		setOp(r, "head_object")
 		h.handleGetOrHeadObject(w, r, bucket, key)
 
 	case http.MethodDelete:
 		if q.Has("uploadId") {
 			if hasUnsupportedQuery(q, "uploadId") {
+				setOp(r, "unsupported")
 				h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 				return
 			}
+			setOp(r, "abort_multipart")
 			h.handleAbortMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
 			return
 		}
 		if hasUnsupportedQuery(q) {
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
 		}
+		setOp(r, "delete_object")
 		if err := h.store.DeleteObject(bucket, key); err != nil {
 			h.writeMappedError(w, r, err)
 			return
@@ -249,19 +277,23 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 	case http.MethodPost:
 		switch {
 		case q.Has("uploads") && !hasUnsupportedQuery(q, "uploads"):
+			setOp(r, "initiate_multipart")
 			h.handleCreateMultipartUpload(w, r, bucket, key)
 		case q.Has("uploadId") && !hasUnsupportedQuery(q, "uploadId"):
+			setOp(r, "complete_multipart")
 			h.handleCompleteMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
 		default:
+			setOp(r, "unsupported")
 			h.writeNotImplemented(w, r, "The requested object operation is not supported.")
 		}
 
 	default:
+		setOp(r, "unsupported")
 		h.writeMethodNotAllowed(w, r)
 	}
 }
 
-func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.Reader, blob.PutOptions, func(bool), bool) {
+func (h *Handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.Reader, blob.PutOptions, func(bool), bool) {
 	var wantMD5 string
 	if rawMD5 := r.Header.Get("Content-MD5"); rawMD5 != "" {
 		sum, err := base64.StdEncoding.DecodeString(rawMD5)
@@ -355,7 +387,7 @@ func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.
 	}, cleanup, true
 }
 
-func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (h *Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	body, checks, cleanup, ok := h.prepareUploadBody(w, r)
 	if !ok {
 		return
@@ -378,11 +410,12 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		h.writeMappedError(w, r, err)
 		return
 	}
+	h.metrics.AddBytesIn(obj.Size)
 	w.Header().Set("ETag", `"`+obj.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (h *Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	ct := r.Header.Get("Content-Type")
 	if ct == "" {
 		ct = "application/octet-stream"
@@ -400,7 +433,7 @@ func (h *handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func (h *handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+func (h *Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
 	uploadID := q.Get("uploadId")
 	if uploadID == "" {
 		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
@@ -423,11 +456,12 @@ func (h *handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		h.writeMappedError(w, r, err)
 		return
 	}
+	h.metrics.AddBytesIn(part.Size)
 	w.Header().Set("ETag", `"`+part.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+func (h *Handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
 	uploadID := q.Get("uploadId")
 	if uploadID == "" {
 		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
@@ -507,7 +541,7 @@ func (h *handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket
 	})
 }
 
-func (h *handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+func (h *Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
 	if uploadID == "" {
 		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
 		return
@@ -555,7 +589,7 @@ func (h *handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	})
 }
 
-func (h *handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+func (h *Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
 	if uploadID == "" {
 		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
 		return
@@ -567,7 +601,7 @@ func (h *handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (h *Handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	var (
 		obj domain.Object
 		rdr io.ReadSeekCloser
@@ -612,7 +646,9 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 			abortConnection(w)
 			return
 		}
-		if _, err := io.CopyN(dw, rdr, br.length()); err != nil {
+		copied, err := io.CopyN(dw, rdr, br.length())
+		h.metrics.AddBytesOut(copied)
+		if err != nil {
 			h.log.Error("range read failed", "bucket", bucket, "key", key, "error", err)
 			abortConnection(w)
 		}
@@ -628,7 +664,7 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 	headersSent, integrityErr, writeErr := streamVerified(dw, rdr, obj.Size, obj.SHA256, func() {
 		writeObjectHeaders(w, obj, obj.Size)
 		w.WriteHeader(http.StatusOK)
-	})
+	}, h.metrics.AddBytesOut)
 	if writeErr != nil {
 		return
 	}
@@ -638,13 +674,14 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 			h.writeError(w, r, http.StatusInternalServerError, "InternalError", "Stored object failed integrity check.")
 			return
 		}
+		setErrCode(r, "InternalError")
 		abortConnection(w)
 	}
 }
 
 // streamVerified streams r to w while verifying size and SHA-256. The final
 // chunk is held back until EOF and checksum verification succeed.
-func streamVerified(w io.Writer, r io.Reader, wantSize int64, wantSHA256 string, sendHeaders func()) (headersSent bool, integrityErr error, writeErr error) {
+func streamVerified(w io.Writer, r io.Reader, wantSize int64, wantSHA256 string, sendHeaders func(), onBytes func(int64)) (headersSent bool, integrityErr error, writeErr error) {
 	curr := make([]byte, streamBufSize)
 	prev := make([]byte, streamBufSize)
 	prevLen := 0
@@ -664,7 +701,11 @@ func streamVerified(w io.Writer, r io.Reader, wantSize int64, wantSHA256 string,
 					sendHeaders()
 					headersSent = true
 				}
-				if _, err := w.Write(prev[:prevLen]); err != nil {
+				written, err := w.Write(prev[:prevLen])
+				if onBytes != nil && written > 0 {
+					onBytes(int64(written))
+				}
+				if err != nil {
 					return headersSent, nil, err
 				}
 			}
@@ -684,7 +725,11 @@ func streamVerified(w io.Writer, r io.Reader, wantSize int64, wantSHA256 string,
 				headersSent = true
 			}
 			if prevLen > 0 {
-				if _, err := w.Write(prev[:prevLen]); err != nil {
+				written, err := w.Write(prev[:prevLen])
+				if onBytes != nil && written > 0 {
+					onBytes(int64(written))
+				}
+				if err != nil {
 					return headersSent, nil, err
 				}
 			}
@@ -782,15 +827,15 @@ func hasUnsupportedQuery(q url.Values, allowed ...string) bool {
 	return false
 }
 
-func (h *handler) writeNotImplemented(w http.ResponseWriter, r *http.Request, msg string) {
+func (h *Handler) writeNotImplemented(w http.ResponseWriter, r *http.Request, msg string) {
 	h.writeError(w, r, http.StatusNotImplemented, "NotImplemented", msg)
 }
 
-func (h *handler) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) writeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	h.writeError(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed against this resource.")
 }
 
-func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err error) {
+func (h *Handler) writeMappedError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidBucketName):
 		h.writeError(w, r, http.StatusBadRequest, "InvalidBucketName", err.Error())
@@ -850,7 +895,8 @@ func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err e
 	}
 }
 
-func (h *handler) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	setErrCode(r, code)
 	if r.ContentLength != 0 {
 		w.Header().Set("Connection", "close")
 	}

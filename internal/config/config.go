@@ -3,6 +3,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -20,6 +22,7 @@ const (
 // Config holds the server settings.
 type Config struct {
 	Addr                  string
+	PprofAddr             string
 	DataDir               string
 	ShutdownTimeout       time.Duration
 	IdleTransferTimeout   time.Duration
@@ -40,6 +43,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		Addr:                  env("GOSTORE_ADDR", "127.0.0.1:9000"),
+		PprofAddr:             os.Getenv("GOSTORE_PPROF_ADDR"),
 		DataDir:               env("GOSTORE_DATA_DIR", "./data"),
 		IdleTransferTimeout:   defaultIdleTransferTimeout,
 		MaxConcurrentRequests: defaultMaxConcurrentRequests,
@@ -59,6 +63,9 @@ func Load() (Config, error) {
 	}
 	if cfg.SecretKey == "" {
 		return Config{}, fmt.Errorf("GOSTORE_SECRET_KEY is required")
+	}
+	if cfg.PprofAddr != "" && !isLocalhostAddr(cfg.PprofAddr) {
+		return Config{}, fmt.Errorf("GOSTORE_PPROF_ADDR %q must bind to localhost", cfg.PprofAddr)
 	}
 	raw := env("GOSTORE_SHUTDOWN_TIMEOUT", "30s")
 	d, err := time.ParseDuration(raw)
@@ -138,4 +145,16 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func isLocalhostAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }

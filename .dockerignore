@@ -1,0 +1,9 @@
+.git
+.github
+data
+*.test
+docs
+scripts
+GoStore Implementation Plan.md
+check.ps1
+Makefile
