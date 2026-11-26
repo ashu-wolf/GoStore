@@ -4,9 +4,13 @@ set -euo pipefail
 TMP_DIR="$(mktemp -d)"
 SERVER_PID=""
 cleanup() {
+  local status=$?
   if [[ -n "$SERVER_PID" ]]; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ $status -ne 0 && -f "${TMP_DIR}/server.log" ]]; then
+    cat "${TMP_DIR}/server.log" >&2 || true
   fi
   rm -rf "$TMP_DIR"
 }

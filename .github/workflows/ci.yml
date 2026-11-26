@@ -4,8 +4,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Format
@@ -20,7 +20,7 @@ jobs:
         run: |
           curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" -o /tmp/awscliv2.zip
           unzip -q /tmp/awscliv2.zip -d /tmp/awscli
-          sudo /tmp/awscli/aws/install
-          aws --version
+          sudo /tmp/awscli/aws/install --update
+          aws --version | grep -q "aws-cli/${AWSCLI_VERSION} "
       - name: AWS CLI compatibility check
         run: bash ./scripts/aws_cli_check.sh
