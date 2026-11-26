@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -22,11 +23,35 @@ import (
 // ErrDamaged means an object's data is missing or has the wrong size.
 var ErrDamaged = errors.New("object data is damaged")
 
+// Options configures a storage Engine. Zero fields use defaults.
+type Options struct {
+	MaxPartSize            int64
+	MaxMultipartObjectSize int64
+	MinPartSize            int64
+	MaxUploadParts         int
+	UploadExpiry           time.Duration
+	CompletionRetention    time.Duration
+	ExpiryInterval         time.Duration
+	DisableExpiryWorker    bool
+	Now                    func() time.Time
+}
+
 // Engine is safe for concurrent use. Close it only after all calls return.
 type Engine struct {
 	blobs    *blob.Store
 	meta     *meta.Store
+	opts     Options
+	now      func() time.Time
 	onLookup func() // test hook called after meta lookup in lookupObject
+
+	pinMu         sync.Mutex
+	uploadPins    map[string]int
+	blobPins      map[string]int
+	pendingDelete map[string]bool
+
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 // Report describes what startup recovery found.
@@ -38,9 +63,39 @@ type Report struct {
 	Damaged        []string // "bucket/key" of objects with bad data
 }
 
-// Open loads the data directory and runs recovery. It must finish before the
-// server accepts requests.
-func Open(root string) (_ *Engine, report Report, err error) {
+// Open loads the data directory with default options and runs recovery.
+func Open(root string) (*Engine, Report, error) {
+	return OpenWithOptions(root, Options{})
+}
+
+// OpenWithOptions loads the data directory and runs recovery. It must finish
+// before the server accepts requests.
+func OpenWithOptions(root string, opts Options) (_ *Engine, report Report, err error) {
+	if opts.MaxPartSize <= 0 {
+		opts.MaxPartSize = domain.DefaultMaxPartSize
+	}
+	if opts.MaxMultipartObjectSize <= 0 {
+		opts.MaxMultipartObjectSize = domain.DefaultMaxMultipartObjectSize
+	}
+	if opts.MinPartSize <= 0 {
+		opts.MinPartSize = domain.DefaultMinPartSize
+	}
+	if opts.MaxUploadParts <= 0 {
+		opts.MaxUploadParts = domain.DefaultMaxUploadParts
+	}
+	if opts.UploadExpiry <= 0 {
+		opts.UploadExpiry = domain.DefaultUploadExpiry
+	}
+	if opts.CompletionRetention <= 0 {
+		opts.CompletionRetention = domain.DefaultUploadExpiry
+	}
+	if opts.ExpiryInterval <= 0 {
+		opts.ExpiryInterval = time.Minute
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+
 	blobs, err := blob.Open(root) // also locks the directory
 	if err != nil {
 		return nil, report, err
@@ -83,6 +138,9 @@ func Open(root string) (_ *Engine, report Report, err error) {
 			return nil, report, fmt.Errorf("check blob: %w", sizeErr)
 		}
 	}
+	for _, partBlobID := range m.AllPartBlobIDs() {
+		used[partBlobID] = true
+	}
 	for _, id := range ids {
 		if !used[id] {
 			if err := blobs.Delete(id); err != nil {
@@ -91,12 +149,32 @@ func Open(root string) (_ *Engine, report Report, err error) {
 			report.OrphansRemoved++
 		}
 	}
-	return &Engine{blobs: blobs, meta: m}, report, nil
+	e := &Engine{
+		blobs:         blobs,
+		meta:          m,
+		opts:          opts,
+		now:           opts.Now,
+		uploadPins:    map[string]int{},
+		blobPins:      map[string]int{},
+		pendingDelete: map[string]bool{},
+		stopCh:        make(chan struct{}),
+	}
+	if !opts.DisableExpiryWorker {
+		e.startExpiryWorker()
+	}
+	return e, report, nil
 }
 
-// Close closes the metadata journal and releases the directory lock.
+// Close stops background workers, closes the metadata journal, and releases
+// the directory lock.
 func (e *Engine) Close() error {
-	return errors.Join(e.meta.Close(), e.blobs.Close())
+	var err error
+	e.closeOnce.Do(func() {
+		close(e.stopCh)
+		e.wg.Wait()
+		err = errors.Join(e.meta.Close(), e.blobs.Close())
+	})
+	return err
 }
 
 // CreateBucket validates the name and creates a bucket.
@@ -163,14 +241,14 @@ func (e *Engine) PutObject(ctx context.Context, req PutRequest, body io.Reader) 
 		// If the result is unknown, the record may be on disk, so the blob
 		// must be kept. Recovery removes it if it is unused.
 		if !errors.Is(err, meta.ErrCommitUnknown) {
-			_ = e.blobs.Delete(info.ID)
+			e.deleteBlob(info.ID)
 		}
 		return domain.Object{}, err
 	}
 	crashpoint.Hit("storage.after-commit")
 
 	if old != "" {
-		_ = e.blobs.Delete(old) // recovery retries if this fails
+		e.deleteBlob(old) // recovery retries if this fails
 	}
 	return obj, nil
 }
@@ -308,7 +386,7 @@ func (e *Engine) DeleteObject(bucket, key string) error {
 		return err
 	}
 	if old != "" {
-		_ = e.blobs.Delete(old)
+		e.deleteBlob(old)
 	}
 	return nil
 }

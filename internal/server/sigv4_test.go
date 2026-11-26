@@ -686,7 +686,7 @@ func TestAWSSDKGoV2Integration(t *testing.T) {
 		t.Fatalf("range got %q", gotRange)
 	}
 
-	// DeleteObject & DeleteBucket.
+	// DeleteObject.
 	for k := range objects {
 		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String("sdk-bucket"),
@@ -695,6 +695,80 @@ func TestAWSSDKGoV2Integration(t *testing.T) {
 			t.Fatalf("DeleteObject(%s): %v", k, err)
 		}
 	}
+
+	// Multipart upload through AWS SDK for Go v2 (using small MinPartSize via a second server?
+	// No: a 1-part upload or >= 5 MiB parts works on default MinPartSize! Test 5 MiB + 1 KiB).
+	createOut, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:      aws.String("sdk-bucket"),
+		Key:         aws.String("mp.bin"),
+		ContentType: aws.String("application/octet-stream"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	mpPart1 := bytes.Repeat([]byte("A"), 5<<20)
+	mpPart2 := bytes.Repeat([]byte("B"), 1024)
+	up1, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String("sdk-bucket"),
+		Key:        aws.String("mp.bin"),
+		UploadId:   createOut.UploadId,
+		PartNumber: aws.Int32(1),
+		Body:       bytes.NewReader(mpPart1),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 1: %v", err)
+	}
+	up2, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String("sdk-bucket"),
+		Key:        aws.String("mp.bin"),
+		UploadId:   createOut.UploadId,
+		PartNumber: aws.Int32(2),
+		Body:       bytes.NewReader(mpPart2),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 2: %v", err)
+	}
+	lpOut, err := client.ListParts(ctx, &s3.ListPartsInput{
+		Bucket:   aws.String("sdk-bucket"),
+		Key:      aws.String("mp.bin"),
+		UploadId: createOut.UploadId,
+	})
+	if err != nil || len(lpOut.Parts) != 2 {
+		t.Fatalf("ListParts: %+v, err=%v", lpOut, err)
+	}
+	compOut, err := client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String("sdk-bucket"),
+		Key:      aws.String("mp.bin"),
+		UploadId: createOut.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{
+			Parts: []s3types.CompletedPart{
+				{PartNumber: aws.Int32(1), ETag: up1.ETag},
+				{PartNumber: aws.Int32(2), ETag: up2.ETag},
+			},
+		},
+	})
+	if err != nil || !strings.HasSuffix(aws.ToString(compOut.ETag), `-2"`) {
+		t.Fatalf("CompleteMultipartUpload: %+v, err=%v", compOut, err)
+	}
+	mpGet, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("sdk-bucket"),
+		Key:    aws.String("mp.bin"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject multipart: %v", err)
+	}
+	mpGot, err := io.ReadAll(mpGet.Body)
+	_ = mpGet.Body.Close()
+	if err != nil || len(mpGot) != len(mpPart1)+len(mpPart2) || !bytes.Equal(mpGot[:len(mpPart1)], mpPart1) || !bytes.Equal(mpGot[len(mpPart1):], mpPart2) {
+		t.Fatalf("multipart content mismatch: len=%d err=%v", len(mpGot), err)
+	}
+	if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String("sdk-bucket"),
+		Key:    aws.String("mp.bin"),
+	}); err != nil {
+		t.Fatalf("DeleteObject(mp.bin): %v", err)
+	}
+
 	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String("sdk-bucket")}); err != nil {
 		t.Fatalf("DeleteBucket: %v", err)
 	}

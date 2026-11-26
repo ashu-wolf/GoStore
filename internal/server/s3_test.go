@@ -399,17 +399,15 @@ func TestUnsupportedOperationsRejectedHTTP(t *testing.T) {
 		path    string
 		headers map[string]string
 	}{
-		{"upload part query", http.MethodPut, "/photos/keep.txt?partNumber=1&uploadId=u1", nil},
 		{"object tagging put", http.MethodPut, "/photos/keep.txt?tagging", nil},
 		{"copy object header", http.MethodPut, "/photos/keep.txt", map[string]string{"X-Amz-Copy-Source": "/photos/other"}},
 		{"streaming payload", http.MethodPut, "/photos/keep.txt", map[string]string{"X-Amz-Content-Sha256": "STREAMING-UNKNOWN"}},
-		{"initiate multipart", http.MethodPost, "/photos/keep.txt?uploads", nil},
-		{"complete multipart", http.MethodPost, "/photos/keep.txt?uploadId=u1", nil},
-		{"abort multipart", http.MethodDelete, "/photos/keep.txt?uploadId=u1", nil},
+		{"object version put", http.MethodPut, "/photos/keep.txt?versionId=v1", nil},
 		{"delete tagging", http.MethodDelete, "/photos/keep.txt?tagging", nil},
 		{"get tagging", http.MethodGet, "/photos/keep.txt?tagging", nil},
 		{"list objects v1 omitted", http.MethodGet, "/photos", nil},
 		{"list objects v1 explicit", http.MethodGet, "/photos?list-type=1", nil},
+		{"list multipart uploads", http.MethodGet, "/photos?uploads", nil},
 		{"bucket acl", http.MethodGet, "/photos?acl", nil},
 		{"bucket put acl", http.MethodPut, "/photos?acl", nil},
 		{"batch delete", http.MethodPost, "/photos?delete", nil},
@@ -566,4 +564,115 @@ func TestCorruptedBlobAbortsFullDownload(t *testing.T) {
 			_ = engine.Close()
 		}
 	})
+}
+
+func TestMultipartUploadHTTP(t *testing.T) {
+	dir := t.TempDir()
+	engine, _, err := storage.OpenWithOptions(dir, storage.Options{
+		MinPartSize:         4,
+		DisableExpiryWorker: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	ts := httptest.NewServer(New(slog.New(slog.NewTextHandler(io.Discard, nil)), engine, Options{AllowUnauthenticated: true}))
+	defer ts.Close()
+
+	doReq(t, http.MethodPut, ts.URL+"/photos", nil, nil)
+
+	// Initiate multipart upload.
+	resp, body := doReq(t, http.MethodPost, ts.URL+"/photos/video.bin?uploads", nil, map[string]string{
+		"Content-Type":     "video/mp4",
+		"X-Amz-Meta-Stage": "raw",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initiate status=%d body=%s", resp.StatusCode, body)
+	}
+	var initRes initiateMultipartUploadResultXML
+	if err := xml.Unmarshal(body, &initRes); err != nil {
+		t.Fatal(err)
+	}
+	uploadID := initRes.UploadID
+
+	// Upload parts (with replacement of part 1).
+	doReq(t, http.MethodPut, ts.URL+"/photos/video.bin?partNumber=1&uploadId="+uploadID, strings.NewReader("old1"), nil)
+	r1, _ := doReq(t, http.MethodPut, ts.URL+"/photos/video.bin?partNumber=1&uploadId="+uploadID, strings.NewReader("part-one-"), nil)
+	etag1 := r1.Header.Get("ETag")
+	r2, _ := doReq(t, http.MethodPut, ts.URL+"/photos/video.bin?partNumber=2&uploadId="+uploadID, strings.NewReader("tail"), nil)
+	etag2 := r2.Header.Get("ETag")
+
+	// ListParts pagination.
+	resp, body = doReq(t, http.MethodGet, ts.URL+"/photos/video.bin?uploadId="+uploadID+"&max-parts=1", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list parts status=%d body=%s", resp.StatusCode, body)
+	}
+	var lp listPartsResultXML
+	if err := xml.Unmarshal(body, &lp); err != nil {
+		t.Fatal(err)
+	}
+	if !lp.IsTruncated || len(lp.Parts) != 1 || lp.Parts[0].PartNumber != 1 || lp.Parts[0].ETag != etag1 {
+		t.Fatalf("unexpected list parts page 1: %+v", lp)
+	}
+
+	// Malformed XML & wrong part order return 400.
+	resp, body = doReq(t, http.MethodPost, ts.URL+"/photos/video.bin?uploadId="+uploadID, strings.NewReader("<broken"), nil)
+	if resp.StatusCode != http.StatusBadRequest || decodeErrorXML(t, body).Code != "MalformedXML" {
+		t.Fatalf("malformed xml: status=%d body=%s", resp.StatusCode, body)
+	}
+	badOrderXML := `<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>` + etag2 + `</ETag></Part><Part><PartNumber>1</PartNumber><ETag>` + etag1 + `</ETag></Part></CompleteMultipartUpload>`
+	resp, body = doReq(t, http.MethodPost, ts.URL+"/photos/video.bin?uploadId="+uploadID, strings.NewReader(badOrderXML), nil)
+	if resp.StatusCode != http.StatusBadRequest || decodeErrorXML(t, body).Code != "InvalidPartOrder" {
+		t.Fatalf("bad order: status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// Complete and repeat completion.
+	completeXML := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + etag1 + `</ETag></Part><Part><PartNumber>2</PartNumber><ETag>` + etag2 + `</ETag></Part></CompleteMultipartUpload>`
+	resp, body = doReq(t, http.MethodPost, ts.URL+"/photos/video.bin?uploadId="+uploadID, strings.NewReader(completeXML), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete status=%d body=%s", resp.StatusCode, body)
+	}
+	var comp1 completeMultipartUploadResultXML
+	if err := xml.Unmarshal(body, &comp1); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body = doReq(t, http.MethodPost, ts.URL+"/photos/video.bin?uploadId="+uploadID, strings.NewReader(completeXML), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("repeat complete status=%d body=%s", resp.StatusCode, body)
+	}
+	var comp2 completeMultipartUploadResultXML
+	if err := xml.Unmarshal(body, &comp2); err != nil {
+		t.Fatal(err)
+	}
+	if comp1.ETag != comp2.ETag || !strings.HasSuffix(comp1.ETag, `-2"`) {
+		t.Fatalf("unexpected ETags: %q vs %q", comp1.ETag, comp2.ETag)
+	}
+
+	// Download assembled object and verify content & metadata.
+	resp, body = doReq(t, http.MethodGet, ts.URL+"/photos/video.bin", nil, nil)
+	if resp.StatusCode != http.StatusOK || string(body) != "part-one-tail" ||
+		resp.Header.Get("Content-Type") != "video/mp4" ||
+		resp.Header.Get("X-Amz-Meta-Stage") != "raw" ||
+		resp.Header.Get("ETag") != comp1.ETag {
+		t.Fatalf("get assembled: status=%d headers=%v body=%q", resp.StatusCode, resp.Header, body)
+	}
+
+	// Initiate and abort a second upload.
+	resp, body = doReq(t, http.MethodPost, ts.URL+"/photos/abort.bin?uploads", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+	var initAbort initiateMultipartUploadResultXML
+	_ = xml.Unmarshal(body, &initAbort)
+	doReq(t, http.MethodPut, ts.URL+"/photos/abort.bin?partNumber=1&uploadId="+initAbort.UploadID, strings.NewReader("tmp"), nil)
+	resp, _ = doReq(t, http.MethodDelete, ts.URL+"/photos/abort.bin?uploadId="+initAbort.UploadID, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("abort status=%d", resp.StatusCode)
+	}
+	resp, body = doReq(t, http.MethodGet, ts.URL+"/photos/abort.bin?uploadId="+initAbort.UploadID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound || decodeErrorXML(t, body).Code != "NoSuchUpload" {
+		t.Fatalf("after abort status=%d body=%s", resp.StatusCode, body)
+	}
 }

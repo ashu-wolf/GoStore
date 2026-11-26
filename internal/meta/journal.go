@@ -34,16 +34,25 @@ const (
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
-	opCreateBucket = "create_bucket"
-	opDeleteBucket = "delete_bucket"
-	opPutObject    = "put_object"
-	opDeleteObject = "delete_object"
+	opCreateBucket    = "create_bucket"
+	opDeleteBucket    = "delete_bucket"
+	opPutObject       = "put_object"
+	opDeleteObject    = "delete_object"
+	opCreateUpload    = "create_upload"
+	opPutPart         = "put_part"
+	opAbortUpload     = "abort_upload"
+	opCompleteUpload  = "complete_upload"
+	opSaveCompletion  = "save_completion"
+	opPurgeCompletion = "purge_completion"
 )
 
 type record struct {
-	Op     string         `json:"op"`
-	Bucket *domain.Bucket `json:"bucket,omitempty"`
-	Object *domain.Object `json:"object,omitempty"`
+	Op        string                  `json:"op"`
+	Bucket    *domain.Bucket          `json:"bucket,omitempty"`
+	Object    *domain.Object          `json:"object,omitempty"`
+	Upload    *domain.Upload          `json:"upload,omitempty"`
+	Part      *domain.Part            `json:"part,omitempty"`
+	Completed *domain.CompletedUpload `json:"completed,omitempty"`
 }
 
 func encode(r record) ([]byte, error) {

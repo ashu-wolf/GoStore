@@ -68,6 +68,54 @@ type commonPrefixXML struct {
 	Prefix string `xml:"Prefix"`
 }
 
+type initiateMultipartUploadResultXML struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+}
+
+type completeMultipartUploadReqXML struct {
+	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
+	Parts   []completedPartXML `xml:"Part"`
+}
+
+type completedPartXML struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type completeMultipartUploadResultXML struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+}
+
+type listPartsResultXML struct {
+	XMLName              xml.Name  `xml:"ListPartsResult"`
+	Xmlns                string    `xml:"xmlns,attr"`
+	Bucket               string    `xml:"Bucket"`
+	Key                  string    `xml:"Key"`
+	UploadID             string    `xml:"UploadId"`
+	StorageClass         string    `xml:"StorageClass"`
+	PartNumberMarker     int       `xml:"PartNumberMarker"`
+	NextPartNumberMarker int       `xml:"NextPartNumberMarker"`
+	MaxParts             int       `xml:"MaxParts"`
+	IsTruncated          bool      `xml:"IsTruncated"`
+	Parts                []partXML `xml:"Part"`
+}
+
+type partXML struct {
+	PartNumber   int    `xml:"PartNumber"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
+}
+
 func writeXML(w http.ResponseWriter, status int, v any) {
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)

@@ -50,13 +50,15 @@ fi
 
 printf 'hello from aws cli v2\n' > "${TMP_DIR}/upload.txt"
 dd if=/dev/urandom of="${TMP_DIR}/large.bin" bs=1024 count=200 status=none
+dd if=/dev/urandom of="${TMP_DIR}/multipart.bin" bs=1048576 count=11 status=none
 
 aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket cli-bucket
 aws --endpoint-url "$ENDPOINT" s3api put-object --bucket cli-bucket --key docs/hello.txt --body "${TMP_DIR}/upload.txt"
 aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/large.bin" s3://cli-bucket/docs/large.bin
+aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/multipart.bin" s3://cli-bucket/docs/multipart.bin
 
 aws --endpoint-url "$ENDPOINT" s3 ls s3://cli-bucket/docs/ | grep -q "hello.txt"
-aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket cli-bucket --prefix docs/ | grep -q "docs/large.bin"
+aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket cli-bucket --prefix docs/ | grep -q "docs/multipart.bin"
 
 aws --endpoint-url "$ENDPOINT" s3api get-object --bucket cli-bucket --key docs/hello.txt "${TMP_DIR}/dl.txt" >/dev/null
 cmp -s "${TMP_DIR}/upload.txt" "${TMP_DIR}/dl.txt"
@@ -64,8 +66,12 @@ cmp -s "${TMP_DIR}/upload.txt" "${TMP_DIR}/dl.txt"
 aws --endpoint-url "$ENDPOINT" s3 cp s3://cli-bucket/docs/large.bin "${TMP_DIR}/dl-large.bin"
 cmp -s "${TMP_DIR}/large.bin" "${TMP_DIR}/dl-large.bin"
 
+aws --endpoint-url "$ENDPOINT" s3 cp s3://cli-bucket/docs/multipart.bin "${TMP_DIR}/dl-multipart.bin"
+cmp -s "${TMP_DIR}/multipart.bin" "${TMP_DIR}/dl-multipart.bin"
+
 aws --endpoint-url "$ENDPOINT" s3api delete-object --bucket cli-bucket --key docs/hello.txt
 aws --endpoint-url "$ENDPOINT" s3 rm s3://cli-bucket/docs/large.bin
+aws --endpoint-url "$ENDPOINT" s3 rm s3://cli-bucket/docs/multipart.bin
 aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket cli-bucket
 
 echo "AWS CLI integration check passed"

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -183,13 +184,40 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 			rawSHA != payloadChunkedSigned &&
 			rawSHA != payloadChunkedTrailer &&
 			rawSHA != payloadChunkedUnsigned
-		if hasUnsupportedQuery(q) || r.Header.Get("X-Amz-Copy-Source") != "" || unsupportedStreaming {
+		if r.Header.Get("X-Amz-Copy-Source") != "" || unsupportedStreaming {
+			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
+			return
+		}
+		if q.Has("partNumber") || q.Has("uploadId") {
+			if hasUnsupportedQuery(q, "partNumber", "uploadId") {
+				h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
+				return
+			}
+			h.handleUploadPart(w, r, bucket, key, q)
+			return
+		}
+		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "The requested object upload operation is not supported.")
 			return
 		}
 		h.handlePutObject(w, r, bucket, key)
 
-	case http.MethodGet, http.MethodHead:
+	case http.MethodGet:
+		if q.Has("uploadId") {
+			if hasUnsupportedQuery(q, "uploadId", "max-parts", "part-number-marker", "encoding-type") {
+				h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
+				return
+			}
+			h.handleListParts(w, r, bucket, key, q)
+			return
+		}
+		if hasUnsupportedQuery(q) {
+			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
+			return
+		}
+		h.handleGetOrHeadObject(w, r, bucket, key)
+
+	case http.MethodHead:
 		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
@@ -197,6 +225,14 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 		h.handleGetOrHeadObject(w, r, bucket, key)
 
 	case http.MethodDelete:
+		if q.Has("uploadId") {
+			if hasUnsupportedQuery(q, "uploadId") {
+				h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
+				return
+			}
+			h.handleAbortMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
+			return
+		}
 		if hasUnsupportedQuery(q) {
 			h.writeNotImplemented(w, r, "Object subresource operations are not supported.")
 			return
@@ -208,20 +244,27 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPost:
-		h.writeNotImplemented(w, r, "The requested object operation is not supported.")
+		switch {
+		case q.Has("uploads") && !hasUnsupportedQuery(q, "uploads"):
+			h.handleCreateMultipartUpload(w, r, bucket, key)
+		case q.Has("uploadId") && !hasUnsupportedQuery(q, "uploadId"):
+			h.handleCompleteMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
+		default:
+			h.writeNotImplemented(w, r, "The requested object operation is not supported.")
+		}
 
 	default:
 		h.writeMethodNotAllowed(w, r)
 	}
 }
 
-func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.Reader, blob.PutOptions, bool) {
 	var wantMD5 string
 	if rawMD5 := r.Header.Get("Content-MD5"); rawMD5 != "" {
 		sum, err := base64.StdEncoding.DecodeString(rawMD5)
 		if err != nil || len(sum) != 16 {
 			h.writeError(w, r, http.StatusBadRequest, "InvalidDigest", "The Content-MD5 you specified was invalid.")
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		wantMD5 = hex.EncodeToString(sum)
 	}
@@ -242,23 +285,23 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		decodedLen, err := strconv.ParseInt(rawDecoded, 10, 64)
 		if err != nil || decodedLen < 0 {
 			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-decoded-content-length header.")
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		if decodedLen > h.maxObjectSize {
 			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		wantSize = &decodedLen
 		chunked, err := newAWSChunkedReader(r.Body, auth, parseExpectedTrailers(r.Header))
 		if err != nil {
 			h.writeMappedError(w, r, err)
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		body = chunked
 	} else {
 		if r.ContentLength > h.maxObjectSize {
 			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		if r.ContentLength >= 0 {
 			cl := r.ContentLength
@@ -267,20 +310,34 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		if rawSHA := r.Header.Get("X-Amz-Content-Sha256"); rawSHA != "" && rawSHA != payloadUnsigned {
 			if len(rawSHA) != 64 {
 				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-				return
+				return nil, blob.PutOptions{}, false
 			}
 			if _, err := hex.DecodeString(rawSHA); err != nil {
 				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-				return
+				return nil, blob.PutOptions{}, false
 			}
 			wantSHA256 = rawSHA
 		}
 		wrapped, err := wrapHeaderChecksums(r.Body, r.Header)
 		if err != nil {
 			h.writeMappedError(w, r, err)
-			return
+			return nil, blob.PutOptions{}, false
 		}
 		body = wrapped
+	}
+
+	return body, blob.PutOptions{
+		MaxSize:    h.maxObjectSize,
+		WantSize:   wantSize,
+		WantMD5:    wantMD5,
+		WantSHA256: wantSHA256,
+	}, true
+}
+
+func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	body, checks, ok := h.prepareUploadBody(w, r)
+	if !ok {
+		return
 	}
 
 	ct := r.Header.Get("Content-Type")
@@ -293,12 +350,7 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		Key:         key,
 		ContentType: ct,
 		Metadata:    extractMetadata(r.Header),
-		Checks: blob.PutOptions{
-			MaxSize:    h.maxObjectSize,
-			WantSize:   wantSize,
-			WantMD5:    wantMD5,
-			WantSHA256: wantSHA256,
-		},
+		Checks:      checks,
 	}, body)
 	if err != nil {
 		h.writeMappedError(w, r, err)
@@ -306,6 +358,190 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 	}
 	w.Header().Set("ETag", `"`+obj.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	u, err := h.store.InitiateMultipartUpload(bucket, key, ct, extractMetadata(r.Header))
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	writeXML(w, http.StatusOK, initiateMultipartUploadResultXML{
+		Xmlns:    s3XMLNS,
+		Bucket:   u.Bucket,
+		Key:      u.Key,
+		UploadID: u.ID,
+	})
+}
+
+func (h *handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	uploadID := q.Get("uploadId")
+	if uploadID == "" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
+		return
+	}
+	partNum, err := strconv.Atoi(q.Get("partNumber"))
+	if err != nil || partNum < 1 {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Part number must be a positive integer.")
+		return
+	}
+
+	body, checks, ok := h.prepareUploadBody(w, r)
+	if !ok {
+		return
+	}
+
+	part, err := h.store.UploadPart(r.Context(), bucket, key, uploadID, partNum, checks, body)
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", `"`+part.ETag+`"`)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *handler) handleListParts(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	uploadID := q.Get("uploadId")
+	if uploadID == "" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
+		return
+	}
+	if et := q.Get("encoding-type"); et != "" && et != "url" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid encoding-type parameter.")
+		return
+	}
+	maxParts := h.maxListKeys
+	zeroMax := false
+	if rawMax := q.Get("max-parts"); rawMax != "" {
+		v, err := strconv.Atoi(rawMax)
+		if err != nil || v < 0 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid max-parts parameter.")
+			return
+		}
+		if v == 0 {
+			zeroMax = true
+			maxParts = 1
+		} else if v < maxParts {
+			maxParts = v
+		}
+	}
+	marker := 0
+	if rawMarker := q.Get("part-number-marker"); rawMarker != "" {
+		v, err := strconv.Atoi(rawMarker)
+		if err != nil || v < 0 {
+			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid part-number-marker parameter.")
+			return
+		}
+		marker = v
+	}
+
+	res, err := h.store.ListParts(domain.ListPartsOptions{
+		Bucket:           bucket,
+		Key:              key,
+		UploadID:         uploadID,
+		PartNumberMarker: marker,
+		MaxParts:         maxParts,
+	})
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	if zeroMax {
+		res.Parts = nil
+		res.IsTruncated = false
+		res.NextPartNumberMarker = 0
+		res.MaxParts = 0
+	}
+
+	keyOut := key
+	if q.Get("encoding-type") == "url" {
+		keyOut = url.QueryEscape(key)
+	}
+	partsXML := make([]partXML, len(res.Parts))
+	for i, p := range res.Parts {
+		partsXML[i] = partXML{
+			PartNumber:   p.Number,
+			LastModified: p.ModifiedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			ETag:         `"` + p.ETag + `"`,
+			Size:         p.Size,
+		}
+	}
+	writeXML(w, http.StatusOK, listPartsResultXML{
+		Xmlns:                s3XMLNS,
+		Bucket:               bucket,
+		Key:                  keyOut,
+		UploadID:             uploadID,
+		StorageClass:         "STANDARD",
+		PartNumberMarker:     marker,
+		NextPartNumberMarker: res.NextPartNumberMarker,
+		MaxParts:             res.MaxParts,
+		IsTruncated:          res.IsTruncated,
+		Parts:                partsXML,
+	})
+}
+
+func (h *handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	if uploadID == "" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
+		return
+	}
+	const maxCompleteBody = 4 << 20
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxCompleteBody+1))
+	if err != nil {
+		h.writeError(w, r, http.StatusBadRequest, "MalformedXML", "Could not read completion body.")
+		return
+	}
+	if len(raw) > maxCompleteBody {
+		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Completion request body is too large.")
+		return
+	}
+	if auth, ok := authFromContext(r); ok && auth.payloadMode == payloadSigned {
+		if !strings.EqualFold(sha256Hex(raw), auth.payloadHash) {
+			h.writeError(w, r, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
+			return
+		}
+	}
+
+	var reqXML completeMultipartUploadReqXML
+	if err := xml.Unmarshal(raw, &reqXML); err != nil {
+		h.writeError(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.")
+		return
+	}
+	submitted := make([]domain.CompletedPart, len(reqXML.Parts))
+	for i, p := range reqXML.Parts {
+		submitted[i] = domain.CompletedPart{Number: p.PartNumber, ETag: p.ETag}
+	}
+
+	res, err := h.store.CompleteMultipartUpload(r.Context(), bucket, key, uploadID, submitted)
+	if err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	quotedETag := `"` + res.ETag + `"`
+	w.Header().Set("ETag", quotedETag)
+	writeXML(w, http.StatusOK, completeMultipartUploadResultXML{
+		Xmlns:    s3XMLNS,
+		Location: "/" + bucket + "/" + key,
+		Bucket:   bucket,
+		Key:      key,
+		ETag:     quotedETag,
+	})
+}
+
+func (h *handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string) {
+	if uploadID == "" {
+		h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Missing uploadId parameter.")
+		return
+	}
+	if err := h.store.AbortMultipartUpload(bucket, key, uploadID); err != nil {
+		h.writeMappedError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
@@ -505,6 +741,16 @@ func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err e
 		h.writeError(w, r, http.StatusConflict, "BucketNotEmpty", "The bucket you tried to delete is not empty.")
 	case errors.Is(err, domain.ErrNoSuchKey):
 		h.writeError(w, r, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+	case errors.Is(err, domain.ErrNoSuchUpload):
+		h.writeError(w, r, http.StatusNotFound, "NoSuchUpload", "The specified upload does not exist.")
+	case errors.Is(err, domain.ErrInvalidPart):
+		h.writeError(w, r, http.StatusBadRequest, "InvalidPart", err.Error())
+	case errors.Is(err, domain.ErrInvalidOrder):
+		h.writeError(w, r, http.StatusBadRequest, "InvalidPartOrder", "The list of parts was not in ascending order. Parts list must be specified in order by part number.")
+	case errors.Is(err, domain.ErrEntityTooSmall):
+		h.writeError(w, r, http.StatusBadRequest, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.")
+	case errors.Is(err, domain.ErrEntityTooLarge):
+		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
 	case errors.Is(err, domain.ErrInvalidKey),
 		errors.Is(err, domain.ErrInvalidMetadata),
 		errors.Is(err, domain.ErrInvalidToken),

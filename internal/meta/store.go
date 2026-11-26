@@ -44,6 +44,14 @@ type bucketState struct {
 	keys    []string // sorted in UTF-8 byte order
 }
 
+func (b *bucketState) putObject(o domain.Object) {
+	if _, exists := b.objects[o.Key]; !exists {
+		i, _ := slices.BinarySearch(b.keys, o.Key)
+		b.keys = slices.Insert(b.keys, i, o.Key)
+	}
+	b.objects[o.Key] = o
+}
+
 type journalFile interface {
 	io.Writer
 	Sync() error
@@ -62,8 +70,10 @@ type Store struct {
 	journal journalFile
 	failed  error
 
-	mu      sync.RWMutex // protects buckets; never held while syncing
-	buckets map[string]*bucketState
+	mu          sync.RWMutex // protects buckets, uploads, and completions; never held while syncing
+	buckets     map[string]*bucketState
+	uploads     map[string]*uploadState
+	completions map[string]domain.CompletedUpload
 }
 
 // Open loads the journal at path. If the file does not exist, it is created only
@@ -83,7 +93,11 @@ func Open(path string, allowCreate bool) (*Store, OpenReport, error) {
 		return nil, report, err
 	}
 
-	s := &Store{buckets: map[string]*bucketState{}}
+	s := &Store{
+		buckets:     map[string]*bucketState{},
+		uploads:     map[string]*uploadState{},
+		completions: map[string]domain.CompletedUpload{},
+	}
 	good, count, err := replay(data, s.apply)
 	if err != nil {
 		return nil, report, err
@@ -166,11 +180,7 @@ func (s *Store) apply(r record) error {
 			return domain.ErrNoSuchBucket
 		}
 		if r.Op == opPutObject {
-			if _, exists := b.objects[r.Object.Key]; !exists {
-				i, _ := slices.BinarySearch(b.keys, r.Object.Key)
-				b.keys = slices.Insert(b.keys, i, r.Object.Key)
-			}
-			b.objects[r.Object.Key] = *r.Object
+			b.putObject(*r.Object)
 		} else {
 			if _, exists := b.objects[r.Object.Key]; exists {
 				if i, found := slices.BinarySearch(b.keys, r.Object.Key); found {
@@ -179,6 +189,8 @@ func (s *Store) apply(r record) error {
 				delete(b.objects, r.Object.Key)
 			}
 		}
+	case r.Op == opCreateUpload || r.Op == opPutPart || r.Op == opAbortUpload || r.Op == opCompleteUpload || r.Op == opSaveCompletion || r.Op == opPurgeCompletion:
+		return s.applyMultipart(r)
 	default:
 		return fmt.Errorf("unknown record %q", r.Op)
 	}
@@ -196,6 +208,7 @@ func (s *Store) snapshot() []record {
 			out = append(out, record{Op: opPutObject, Object: &o})
 		}
 	}
+	out = append(out, s.snapshotMultipart()...)
 	return out
 }
 

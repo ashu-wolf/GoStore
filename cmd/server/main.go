@@ -31,7 +31,13 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	// Recovery finishes before the server starts listening.
-	engine, report, err := storage.Open(cfg.DataDir)
+	engine, report, err := storage.OpenWithOptions(cfg.DataDir, storage.Options{
+		MaxPartSize:            cfg.MaxObjectSize,
+		MaxMultipartObjectSize: cfg.MaxMultipartSize,
+		MinPartSize:            cfg.MinPartSize,
+		MaxUploadParts:         cfg.MaxUploadParts,
+		UploadExpiry:           cfg.UploadExpiry,
+	})
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}

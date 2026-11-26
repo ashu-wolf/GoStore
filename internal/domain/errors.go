@@ -17,4 +17,8 @@ var (
 	ErrNoSuchBucket   = errors.New("no such bucket")
 	ErrNoSuchKey      = errors.New("no such key")
 	ErrNoSuchUpload   = errors.New("no such upload")
+	ErrInvalidPart    = errors.New("invalid part")
+	ErrInvalidOrder   = errors.New("invalid part order")
+	ErrEntityTooSmall = errors.New("entity too small")
+	ErrEntityTooLarge = errors.New("entity too large")
 )

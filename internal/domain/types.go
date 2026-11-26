@@ -45,8 +45,49 @@ type Part struct {
 	ModifiedAt time.Time
 }
 
-// DefaultMaxKeys is the default page size for object listings.
-const DefaultMaxKeys = 1000
+// Default limits for listing and multipart uploads.
+const (
+	DefaultMaxKeys                = 1000
+	DefaultMaxPartSize            = int64(1 << 30) // 1 GiB
+	DefaultMaxMultipartObjectSize = int64(5 << 30) // 5 GiB
+	DefaultMinPartSize            = int64(5 << 20) // 5 MiB
+	DefaultMaxUploadParts         = 10000
+	DefaultUploadExpiry           = 24 * time.Hour
+)
+
+// CompletedPart identifies one part submitted to CompleteMultipartUpload.
+type CompletedPart struct {
+	Number int
+	ETag   string
+}
+
+// CompletedUpload caches the result of completing an upload for idempotent retries.
+type CompletedUpload struct {
+	UploadID    string
+	Bucket      string
+	Key         string
+	ETag        string
+	CompletedAt time.Time
+}
+
+// ListPartsOptions controls a multipart upload part listing.
+type ListPartsOptions struct {
+	Bucket           string
+	Key              string
+	UploadID         string
+	PartNumberMarker int
+	MaxParts         int
+}
+
+// ListPartsResult is one page of uploaded parts.
+type ListPartsResult struct {
+	Upload               Upload
+	Parts                []Part
+	PartNumberMarker     int
+	NextPartNumberMarker int
+	MaxParts             int
+	IsTruncated          bool
+}
 
 // ListOptions controls a bucket object listing.
 type ListOptions struct {
