@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"testing/iotest"
 )
@@ -324,5 +325,39 @@ func TestConcurrentPuts(t *testing.T) {
 	wg.Wait()
 	if n := fileCount(t, s); n != 32 {
 		t.Fatalf("want 32 files, got %d", n)
+	}
+}
+
+type enospcFile struct {
+	tempFile
+}
+
+func (f enospcFile) Write(p []byte) (int, error) {
+	return 0, syscall.ENOSPC
+}
+
+func TestPutENOSPCLeavesNoTempFiles(t *testing.T) {
+	s := newStore(t)
+	keep, err := s.Put(context.Background(), strings.NewReader("committed"), PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	realCreate := s.ops.createTemp
+	s.ops.createTemp = func(dir string) (tempFile, error) {
+		f, err := realCreate(dir)
+		if err != nil {
+			return nil, err
+		}
+		return enospcFile{f}, nil
+	}
+	if _, err := s.Put(context.Background(), strings.NewReader("fails"), PutOptions{}); !errors.Is(err, ErrNoSpace) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("want ErrNoSpace/ENOSPC, got %v", err)
+	}
+	if n := fileCount(t, s); n != 1 {
+		t.Fatalf("want only 1 committed file, got %d", n)
+	}
+	if got := readBlob(t, s, keep.ID); string(got) != "committed" {
+		t.Fatalf("committed blob corrupted: %q", got)
 	}
 }

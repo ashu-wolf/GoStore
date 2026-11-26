@@ -32,17 +32,25 @@ type Options struct {
 	UploadExpiry           time.Duration
 	CompletionRetention    time.Duration
 	ExpiryInterval         time.Duration
+	MinFreeSpace           int64
+	DisableSpaceCheck      bool
 	DisableExpiryWorker    bool
 	Now                    func() time.Time
+	Statfs                 func(path string) (int64, error)
 }
 
 // Engine is safe for concurrent use. Close it only after all calls return.
 type Engine struct {
+	root     string
 	blobs    *blob.Store
 	meta     *meta.Store
 	opts     Options
 	now      func() time.Time
+	statfs   func(path string) (int64, error)
 	onLookup func() // test hook called after meta lookup in lookupObject
+
+	spaceMu       sync.Mutex
+	reservedBytes int64
 
 	pinMu         sync.Mutex
 	uploadPins    map[string]int
@@ -92,8 +100,14 @@ func OpenWithOptions(root string, opts Options) (_ *Engine, report Report, err e
 	if opts.ExpiryInterval <= 0 {
 		opts.ExpiryInterval = time.Minute
 	}
+	if opts.MinFreeSpace == 0 {
+		opts.MinFreeSpace = defaultMinFreeSpace
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+	if opts.Statfs == nil {
+		opts.Statfs = statfsAvail
 	}
 
 	blobs, err := blob.Open(root) // also locks the directory
@@ -150,10 +164,12 @@ func OpenWithOptions(root string, opts Options) (_ *Engine, report Report, err e
 		}
 	}
 	e := &Engine{
+		root:          root,
 		blobs:         blobs,
 		meta:          m,
 		opts:          opts,
 		now:           opts.Now,
+		statfs:        opts.Statfs,
 		uploadPins:    map[string]int{},
 		blobPins:      map[string]int{},
 		pendingDelete: map[string]bool{},
@@ -219,9 +235,33 @@ func (e *Engine) PutObject(ctx context.Context, req PutRequest, body io.Reader) 
 		return domain.Object{}, domain.ErrNoSuchBucket
 	}
 
-	info, err := e.blobs.Put(ctx, body, req.Checks)
+	var need int64
+	checkDynamic := true
+	if req.Checks.WantSize != nil {
+		need = *req.Checks.WantSize
+		checkDynamic = false
+	}
+	resv, err := e.reserveSpace(need, checkDynamic)
 	if err != nil {
 		return domain.Object{}, err
+	}
+	defer resv.release()
+
+	checks := req.Checks
+	prevOnWrite := checks.OnWrite
+	checks.OnWrite = func(n int64) error {
+		if err := resv.consume(n); err != nil {
+			return err
+		}
+		if prevOnWrite != nil {
+			return prevOnWrite(n)
+		}
+		return nil
+	}
+
+	info, err := e.blobs.Put(ctx, body, checks)
+	if err != nil {
+		return domain.Object{}, mapBlobErr(err)
 	}
 	obj := domain.Object{
 		Bucket:      req.Bucket,

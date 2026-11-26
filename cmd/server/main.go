@@ -37,6 +37,8 @@ func run(log *slog.Logger) error {
 		MinPartSize:            cfg.MinPartSize,
 		MaxUploadParts:         cfg.MaxUploadParts,
 		UploadExpiry:           cfg.UploadExpiry,
+		MinFreeSpace:           cfg.MinFreeSpace,
+		DisableSpaceCheck:      cfg.MinFreeSpace == 0,
 	})
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
@@ -58,11 +60,13 @@ func run(log *slog.Logger) error {
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: server.New(log, engine, server.Options{
-			MaxObjectSize: cfg.MaxObjectSize,
-			MaxListKeys:   cfg.ListPageSize,
-			AccessKey:     cfg.AccessKey,
-			SecretKey:     cfg.SecretKey,
-			Region:        cfg.Region,
+			MaxObjectSize:         cfg.MaxObjectSize,
+			MaxListKeys:           cfg.ListPageSize,
+			MaxConcurrentRequests: cfg.MaxConcurrentRequests,
+			IdleTransferTimeout:   cfg.IdleTransferTimeout,
+			AccessKey:             cfg.AccessKey,
+			SecretKey:             cfg.SecretKey,
+			Region:                cfg.Region,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,

@@ -70,9 +70,32 @@ func (e *Engine) UploadPart(ctx context.Context, bucket, key, uploadID string, p
 		return domain.Part{}, err
 	}
 
-	info, err := e.blobs.Put(ctx, body, checks)
+	var need int64
+	checkDynamic := true
+	if checks.WantSize != nil {
+		need = *checks.WantSize
+		checkDynamic = false
+	}
+	resv, err := e.reserveSpace(need, checkDynamic)
 	if err != nil {
 		return domain.Part{}, err
+	}
+	defer resv.release()
+
+	prevOnWrite := checks.OnWrite
+	checks.OnWrite = func(n int64) error {
+		if err := resv.consume(n); err != nil {
+			return err
+		}
+		if prevOnWrite != nil {
+			return prevOnWrite(n)
+		}
+		return nil
+	}
+
+	info, err := e.blobs.Put(ctx, body, checks)
+	if err != nil {
+		return domain.Part{}, mapBlobErr(err)
 	}
 	p := domain.Part{
 		UploadID:   uploadID,
@@ -203,12 +226,21 @@ func (e *Engine) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 		selected[i] = p
 	}
 
+	resv, err := e.reserveSpace(totalSize, false)
+	if err != nil {
+		return domain.CompletedUpload{}, err
+	}
+	defer resv.release()
+
 	mbr := &multiBlobReader{blobs: e.blobs, parts: selected}
 	defer mbr.Close()
 
-	assembled, err := e.blobs.Put(ctx, mbr, blob.PutOptions{WantSize: &totalSize})
+	assembled, err := e.blobs.Put(ctx, mbr, blob.PutOptions{
+		WantSize: &totalSize,
+		OnWrite:  resv.consume,
+	})
 	if err != nil {
-		return domain.CompletedUpload{}, err
+		return domain.CompletedUpload{}, mapBlobErr(err)
 	}
 
 	mpETag := fmt.Sprintf("%s-%d", hex.EncodeToString(md5OfMD5s.Sum(nil)), len(selected))
@@ -251,7 +283,7 @@ func (e *Engine) CompleteMultipartUpload(ctx context.Context, bucket, key, uploa
 }
 
 // ExpireUploads aborts inactive uploads older than UploadExpiry and purges
-// expired completion records.
+// expired completion records. Cleanup stops promptly if Close is called.
 func (e *Engine) ExpireUploads(now time.Time) (int, error) {
 	utcNow := now.UTC()
 	expiredBlobs, count, err := e.meta.ExpireUploads(
@@ -259,7 +291,14 @@ func (e *Engine) ExpireUploads(now time.Time) (int, error) {
 		utcNow.Add(-e.opts.CompletionRetention),
 		e.isUploadActive,
 	)
-	e.deleteBlobs(expiredBlobs)
+	for _, id := range expiredBlobs {
+		select {
+		case <-e.stopCh:
+			return count, err
+		default:
+			e.deleteBlob(id)
+		}
+	}
 	return count, err
 }
 

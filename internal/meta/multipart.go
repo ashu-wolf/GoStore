@@ -311,6 +311,10 @@ func (s *Store) ExpireUploads(uploadCutoff, completionCutoff time.Time, isActive
 		toAbort = append(toAbort, id)
 	}
 	slices.Sort(toAbort)
+	const maxExpirePerRun = 100
+	if len(toAbort) > maxExpirePerRun {
+		toAbort = toAbort[:maxExpirePerRun]
+	}
 
 	for _, id := range toAbort {
 		u := s.uploads[id]

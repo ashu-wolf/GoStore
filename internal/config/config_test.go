@@ -18,6 +18,7 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.Addr != "127.0.0.1:9000" || cfg.MaxObjectSize != 1<<30 || cfg.ListPageSize != 1000 ||
 		cfg.MaxMultipartSize != 5<<30 || cfg.MinPartSize != 5<<20 || cfg.MaxUploadParts != 10000 ||
+		cfg.MaxConcurrentRequests != 256 || cfg.MinFreeSpace != 1<<30 ||
 		cfg.AccessKey != "test-access" || cfg.SecretKey != "test-secret" || cfg.Region != "us-east-1" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
@@ -27,6 +28,9 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("GOSTORE_MIN_PART_SIZE", "512")
 	t.Setenv("GOSTORE_MAX_UPLOAD_PARTS", "20")
 	t.Setenv("GOSTORE_UPLOAD_EXPIRY", "10m")
+	t.Setenv("GOSTORE_MAX_CONCURRENT_REQUESTS", "32")
+	t.Setenv("GOSTORE_IDLE_TRANSFER_TIMEOUT", "15s")
+	t.Setenv("GOSTORE_MIN_FREE_SPACE", "2048")
 	t.Setenv("GOSTORE_LIST_PAGE_SIZE", "25")
 	t.Setenv("GOSTORE_REGION", "eu-west-1")
 	cfg, err = Load()
@@ -34,7 +38,8 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxObjectSize != 4096 || cfg.MaxMultipartSize != 8192 || cfg.MinPartSize != 512 ||
-		cfg.MaxUploadParts != 20 || cfg.ListPageSize != 25 || cfg.Region != "eu-west-1" {
+		cfg.MaxUploadParts != 20 || cfg.MaxConcurrentRequests != 32 || cfg.MinFreeSpace != 2048 ||
+		cfg.ListPageSize != 25 || cfg.Region != "eu-west-1" {
 		t.Fatalf("unexpected overrides: %+v", cfg)
 	}
 

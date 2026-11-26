@@ -11,39 +11,48 @@ import (
 )
 
 const (
-	defaultMaxObjectSize = int64(1 << 30) // 1 GiB
+	defaultMaxObjectSize         = int64(1 << 30) // 1 GiB
+	defaultMinFreeSpace          = int64(1 << 30) // 1 GiB
+	defaultMaxConcurrentRequests = 256
+	defaultIdleTransferTimeout   = 60 * time.Second
 )
 
 // Config holds the server settings.
 type Config struct {
-	Addr             string
-	DataDir          string
-	ShutdownTimeout  time.Duration
-	MaxObjectSize    int64
-	MaxMultipartSize int64
-	MinPartSize      int64
-	MaxUploadParts   int
-	UploadExpiry     time.Duration
-	ListPageSize     int
-	AccessKey        string
-	SecretKey        string
-	Region           string
+	Addr                  string
+	DataDir               string
+	ShutdownTimeout       time.Duration
+	IdleTransferTimeout   time.Duration
+	MaxConcurrentRequests int
+	MaxObjectSize         int64
+	MaxMultipartSize      int64
+	MinPartSize           int64
+	MaxUploadParts        int
+	UploadExpiry          time.Duration
+	MinFreeSpace          int64
+	ListPageSize          int
+	AccessKey             string
+	SecretKey             string
+	Region                string
 }
 
 // Load reads the settings and applies defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:             env("GOSTORE_ADDR", "127.0.0.1:9000"),
-		DataDir:          env("GOSTORE_DATA_DIR", "./data"),
-		MaxObjectSize:    defaultMaxObjectSize,
-		MaxMultipartSize: domain.DefaultMaxMultipartObjectSize,
-		MinPartSize:      domain.DefaultMinPartSize,
-		MaxUploadParts:   domain.DefaultMaxUploadParts,
-		UploadExpiry:     domain.DefaultUploadExpiry,
-		ListPageSize:     domain.DefaultMaxKeys,
-		AccessKey:        os.Getenv("GOSTORE_ACCESS_KEY"),
-		SecretKey:        os.Getenv("GOSTORE_SECRET_KEY"),
-		Region:           env("GOSTORE_REGION", "us-east-1"),
+		Addr:                  env("GOSTORE_ADDR", "127.0.0.1:9000"),
+		DataDir:               env("GOSTORE_DATA_DIR", "./data"),
+		IdleTransferTimeout:   defaultIdleTransferTimeout,
+		MaxConcurrentRequests: defaultMaxConcurrentRequests,
+		MaxObjectSize:         defaultMaxObjectSize,
+		MaxMultipartSize:      domain.DefaultMaxMultipartObjectSize,
+		MinPartSize:           domain.DefaultMinPartSize,
+		MaxUploadParts:        domain.DefaultMaxUploadParts,
+		UploadExpiry:          domain.DefaultUploadExpiry,
+		MinFreeSpace:          defaultMinFreeSpace,
+		ListPageSize:          domain.DefaultMaxKeys,
+		AccessKey:             os.Getenv("GOSTORE_ACCESS_KEY"),
+		SecretKey:             os.Getenv("GOSTORE_SECRET_KEY"),
+		Region:                env("GOSTORE_REGION", "us-east-1"),
 	}
 	if cfg.AccessKey == "" {
 		return Config{}, fmt.Errorf("GOSTORE_ACCESS_KEY is required")
@@ -92,6 +101,27 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid GOSTORE_UPLOAD_EXPIRY %q", rawExp)
 		}
 		cfg.UploadExpiry = exp
+	}
+	if rawConc := os.Getenv("GOSTORE_MAX_CONCURRENT_REQUESTS"); rawConc != "" {
+		v, err := strconv.Atoi(rawConc)
+		if err != nil || v <= 0 {
+			return Config{}, fmt.Errorf("invalid GOSTORE_MAX_CONCURRENT_REQUESTS %q", rawConc)
+		}
+		cfg.MaxConcurrentRequests = v
+	}
+	if rawIdle := os.Getenv("GOSTORE_IDLE_TRANSFER_TIMEOUT"); rawIdle != "" {
+		idle, err := time.ParseDuration(rawIdle)
+		if err != nil || idle <= 0 {
+			return Config{}, fmt.Errorf("invalid GOSTORE_IDLE_TRANSFER_TIMEOUT %q", rawIdle)
+		}
+		cfg.IdleTransferTimeout = idle
+	}
+	if rawFree := os.Getenv("GOSTORE_MIN_FREE_SPACE"); rawFree != "" {
+		v, err := strconv.ParseInt(rawFree, 10, 64)
+		if err != nil || v < 0 {
+			return Config{}, fmt.Errorf("invalid GOSTORE_MIN_FREE_SPACE %q", rawFree)
+		}
+		cfg.MinFreeSpace = v
 	}
 	if rawList := os.Getenv("GOSTORE_LIST_PAGE_SIZE"); rawList != "" {
 		v, err := strconv.Atoi(rawList)

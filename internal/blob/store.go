@@ -36,16 +36,18 @@ var (
 	ErrInvalidID        = errors.New("invalid blob ID")
 	ErrNotFound         = errors.New("blob not found")
 	ErrTooLarge         = errors.New("blob is larger than the limit")
+	ErrNoSpace          = errors.New("no space left on device")
 	ErrSizeMismatch     = errors.New("size does not match")
 	ErrChecksumMismatch = errors.New("checksum does not match")
 )
 
 // PutOptions holds the checks applied to an upload before it is published.
 type PutOptions struct {
-	MaxSize    int64  // 0 means no limit
-	WantSize   *int64 // nil means the size is not checked
-	WantMD5    string // hex; empty means not checked
-	WantSHA256 string // hex; empty means not checked
+	MaxSize    int64             // 0 means no limit
+	WantSize   *int64            // nil means the size is not checked
+	WantMD5    string            // hex; empty means not checked
+	WantSHA256 string            // hex; empty means not checked
+	OnWrite    func(int64) error // optional callback invoked after each chunk write
 }
 
 // Info describes a stored blob.
@@ -160,7 +162,7 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opts PutOptions) (_ Info, 
 	// 1. Stream to a temporary file while counting and hashing.
 	f, err := s.ops.createTemp(s.tmpDir)
 	if err != nil {
-		return Info{}, fmt.Errorf("create temporary file: %w", err)
+		return Info{}, wrapDiskErr("create temporary file", err)
 	}
 	closed, published := false, false
 	defer func() {
@@ -173,7 +175,7 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opts PutOptions) (_ Info, 
 	}()
 
 	md5Hash, shaHash := md5.New(), sha256.New()
-	size, err := copyStream(ctx, io.MultiWriter(f, md5Hash, shaHash), r, opts.MaxSize)
+	size, err := copyStream(ctx, io.MultiWriter(f, md5Hash, shaHash), r, opts.MaxSize, opts.OnWrite)
 	if err != nil {
 		return Info{}, err
 	}
@@ -191,11 +193,11 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opts PutOptions) (_ Info, 
 
 	// 3. Make the file contents durable.
 	if err := f.Sync(); err != nil {
-		return Info{}, fmt.Errorf("sync blob: %w", err)
+		return Info{}, wrapDiskErr("sync blob", err)
 	}
 	closed = true
 	if err := f.Close(); err != nil {
-		return Info{}, fmt.Errorf("close blob: %w", err)
+		return Info{}, wrapDiskErr("close blob", err)
 	}
 
 	crashpoint.Hit("blob.before-rename")
@@ -203,13 +205,13 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opts PutOptions) (_ Info, 
 	// 4. Publish with an atomic rename, then make the rename durable.
 	final := s.path(id)
 	if err := s.ops.rename(f.Name(), final); err != nil {
-		return Info{}, fmt.Errorf("publish blob: %w", err)
+		return Info{}, wrapDiskErr("publish blob", err)
 	}
 	published = true
 	crashpoint.Hit("blob.after-rename")
 	if err := s.ops.syncDir(filepath.Dir(final)); err != nil {
 		_ = os.Remove(final) // best effort; startup cleanup handles leftovers
-		return Info{}, fmt.Errorf("sync blob directory: %w", err)
+		return Info{}, wrapDiskErr("sync blob directory", err)
 	}
 	return info, nil
 }
@@ -248,7 +250,7 @@ func (s *Store) path(id string) string {
 }
 
 // copyStream copies src to dst through one fixed-size buffer.
-func copyStream(ctx context.Context, dst io.Writer, src io.Reader, maxSize int64) (int64, error) {
+func copyStream(ctx context.Context, dst io.Writer, src io.Reader, maxSize int64, onWrite func(int64) error) (int64, error) {
 	buf := make([]byte, bufferSize)
 	var total int64
 	for {
@@ -263,7 +265,12 @@ func copyStream(ctx context.Context, dst io.Writer, src io.Reader, maxSize int64
 			written, err := dst.Write(buf[:n])
 			total += int64(written)
 			if err != nil {
-				return total, fmt.Errorf("write blob: %w", err)
+				return total, wrapDiskErr("write blob", err)
+			}
+			if written > 0 && onWrite != nil {
+				if err := onWrite(int64(written)); err != nil {
+					return total, err
+				}
 			}
 		}
 		if readErr == io.EOF {
@@ -273,6 +280,13 @@ func copyStream(ctx context.Context, dst io.Writer, src io.Reader, maxSize int64
 			return total, fmt.Errorf("read upload: %w", readErr)
 		}
 	}
+}
+
+func wrapDiskErr(op string, err error) error {
+	if errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("%s: %w: %w", op, ErrNoSpace, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 func verify(info Info, opts PutOptions) error {

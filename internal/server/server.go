@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	defaultMaxObjectSize = int64(1 << 30) // 1 GiB
-	defaultRegion        = "us-east-1"
+	defaultMaxObjectSize         = int64(1 << 30) // 1 GiB
+	defaultMaxConcurrentRequests = 256
+	defaultIdleTransferTimeout   = 60 * time.Second
+	defaultRegion                = "us-east-1"
 )
 
 type (
@@ -30,23 +32,27 @@ type (
 
 // Options configures the HTTP handler. Zero fields use defaults.
 type Options struct {
-	MaxObjectSize        int64
-	MaxListKeys          int
-	AccessKey            string
-	SecretKey            string
-	Region               string
-	ClockSkew            time.Duration
-	Now                  func() time.Time
-	AllowUnauthenticated bool
+	MaxObjectSize         int64
+	MaxListKeys           int
+	MaxConcurrentRequests int
+	IdleTransferTimeout   time.Duration
+	AccessKey             string
+	SecretKey             string
+	Region                string
+	ClockSkew             time.Duration
+	Now                   func() time.Time
+	AllowUnauthenticated  bool
 }
 
 type handler struct {
-	log           *slog.Logger
-	store         *storage.Engine
-	maxObjectSize int64
-	maxListKeys   int
-	allowUnauth   bool
-	authCfg       sigV4Config
+	log                 *slog.Logger
+	store               *storage.Engine
+	maxObjectSize       int64
+	maxListKeys         int
+	idleTransferTimeout time.Duration
+	sem                 chan struct{}
+	allowUnauth         bool
+	authCfg             sigV4Config
 }
 
 // New returns the application's HTTP handler.
@@ -62,6 +68,12 @@ func New(log *slog.Logger, store *storage.Engine, opts ...Options) http.Handler 
 	if opt.MaxListKeys <= 0 || opt.MaxListKeys > domain.DefaultMaxKeys {
 		opt.MaxListKeys = domain.DefaultMaxKeys
 	}
+	if opt.MaxConcurrentRequests <= 0 {
+		opt.MaxConcurrentRequests = defaultMaxConcurrentRequests
+	}
+	if opt.IdleTransferTimeout <= 0 {
+		opt.IdleTransferTimeout = defaultIdleTransferTimeout
+	}
 	if opt.Region == "" {
 		opt.Region = defaultRegion
 	}
@@ -72,11 +84,13 @@ func New(log *slog.Logger, store *storage.Engine, opts ...Options) http.Handler 
 		opt.Now = time.Now
 	}
 	h := &handler{
-		log:           log,
-		store:         store,
-		maxObjectSize: opt.MaxObjectSize,
-		maxListKeys:   opt.MaxListKeys,
-		allowUnauth:   opt.AllowUnauthenticated,
+		log:                 log,
+		store:               store,
+		maxObjectSize:       opt.MaxObjectSize,
+		maxListKeys:         opt.MaxListKeys,
+		idleTransferTimeout: opt.IdleTransferTimeout,
+		sem:                 make(chan struct{}, opt.MaxConcurrentRequests),
+		allowUnauth:         opt.AllowUnauthenticated,
 		authCfg: sigV4Config{
 			accessKey: opt.AccessKey,
 			secretKey: opt.SecretKey,
@@ -104,6 +118,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if raw == "-" || strings.HasPrefix(raw, "-/") {
 		http.NotFound(w, r)
+		return
+	}
+
+	if err := r.Context().Err(); err != nil {
+		return
+	}
+	select {
+	case h.sem <- struct{}{}:
+		defer func() { <-h.sem }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		h.writeError(w, r, http.StatusServiceUnavailable, "SlowDown", "Please reduce your request rate.")
 		return
 	}
 

@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,8 +13,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ashu-wolf/gostore/internal/blob"
 	"github.com/ashu-wolf/gostore/internal/domain"
@@ -258,13 +261,13 @@ func (h *handler) handleObject(w http.ResponseWriter, r *http.Request, bucket, k
 	}
 }
 
-func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.Reader, blob.PutOptions, bool) {
+func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.Reader, blob.PutOptions, func(bool), bool) {
 	var wantMD5 string
 	if rawMD5 := r.Header.Get("Content-MD5"); rawMD5 != "" {
 		sum, err := base64.StdEncoding.DecodeString(rawMD5)
 		if err != nil || len(sum) != 16 {
 			h.writeError(w, r, http.StatusBadRequest, "InvalidDigest", "The Content-MD5 you specified was invalid.")
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		wantMD5 = hex.EncodeToString(sum)
 	}
@@ -274,34 +277,49 @@ func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.
 		auth.payloadMode == payloadChunkedTrailer ||
 		auth.payloadMode == payloadChunkedUnsigned)
 
+	rc := http.NewResponseController(w)
+	var body io.Reader = &deadlineReader{
+		r:       r.Body,
+		rc:      rc,
+		timeout: h.idleTransferTimeout,
+	}
+	cleanup := func(resetDeadline bool) {
+		if resetDeadline && h.idleTransferTimeout > 0 {
+			_ = rc.SetReadDeadline(time.Time{})
+		}
+	}
+
 	var (
 		wantSize   *int64
 		wantSHA256 string
-		body       io.Reader = r.Body
 	)
 
 	if isChunked {
 		rawDecoded := r.Header.Get("X-Amz-Decoded-Content-Length")
 		decodedLen, err := strconv.ParseInt(rawDecoded, 10, 64)
 		if err != nil || decodedLen < 0 {
+			cleanup(false)
 			h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-decoded-content-length header.")
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		if decodedLen > h.maxObjectSize {
+			cleanup(false)
 			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		wantSize = &decodedLen
-		chunked, err := newAWSChunkedReader(r.Body, auth, parseExpectedTrailers(r.Header))
+		chunked, err := newAWSChunkedReader(body, auth, parseExpectedTrailers(r.Header))
 		if err != nil {
+			cleanup(false)
 			h.writeMappedError(w, r, err)
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		body = chunked
 	} else {
 		if r.ContentLength > h.maxObjectSize {
+			cleanup(false)
 			h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		if r.ContentLength >= 0 {
 			cl := r.ContentLength
@@ -309,19 +327,22 @@ func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.
 		}
 		if rawSHA := r.Header.Get("X-Amz-Content-Sha256"); rawSHA != "" && rawSHA != payloadUnsigned {
 			if len(rawSHA) != 64 {
+				cleanup(false)
 				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-				return nil, blob.PutOptions{}, false
+				return nil, blob.PutOptions{}, nil, false
 			}
 			if _, err := hex.DecodeString(rawSHA); err != nil {
+				cleanup(false)
 				h.writeError(w, r, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-content-sha256 header.")
-				return nil, blob.PutOptions{}, false
+				return nil, blob.PutOptions{}, nil, false
 			}
 			wantSHA256 = rawSHA
 		}
-		wrapped, err := wrapHeaderChecksums(r.Body, r.Header)
+		wrapped, err := wrapHeaderChecksums(body, r.Header)
 		if err != nil {
+			cleanup(false)
 			h.writeMappedError(w, r, err)
-			return nil, blob.PutOptions{}, false
+			return nil, blob.PutOptions{}, nil, false
 		}
 		body = wrapped
 	}
@@ -331,11 +352,11 @@ func (h *handler) prepareUploadBody(w http.ResponseWriter, r *http.Request) (io.
 		WantSize:   wantSize,
 		WantMD5:    wantMD5,
 		WantSHA256: wantSHA256,
-	}, true
+	}, cleanup, true
 }
 
 func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	body, checks, ok := h.prepareUploadBody(w, r)
+	body, checks, cleanup, ok := h.prepareUploadBody(w, r)
 	if !ok {
 		return
 	}
@@ -352,6 +373,7 @@ func (h *handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket
 		Metadata:    extractMetadata(r.Header),
 		Checks:      checks,
 	}, body)
+	cleanup(err == nil)
 	if err != nil {
 		h.writeMappedError(w, r, err)
 		return
@@ -390,12 +412,13 @@ func (h *handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucke
 		return
 	}
 
-	body, checks, ok := h.prepareUploadBody(w, r)
+	body, checks, cleanup, ok := h.prepareUploadBody(w, r)
 	if !ok {
 		return
 	}
 
 	part, err := h.store.UploadPart(r.Context(), bucket, key, uploadID, partNum, checks, body)
+	cleanup(err == nil)
 	if err != nil {
 		h.writeMappedError(w, r, err)
 		return
@@ -563,6 +586,14 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 		defer rdr.Close()
 	}
 
+	rc := http.NewResponseController(w)
+	dw := &deadlineWriter{w: w, rc: rc, timeout: h.idleTransferTimeout}
+	defer func() {
+		if h.idleTransferTimeout > 0 {
+			_ = rc.SetWriteDeadline(time.Time{})
+		}
+	}()
+
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 		br, err := parseByteRange(rangeHdr, obj.Size)
 		if err != nil {
@@ -581,7 +612,7 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 			abortConnection(w)
 			return
 		}
-		if _, err := io.CopyN(w, rdr, br.length()); err != nil {
+		if _, err := io.CopyN(dw, rdr, br.length()); err != nil {
 			h.log.Error("range read failed", "bucket", bucket, "key", key, "error", err)
 			abortConnection(w)
 		}
@@ -594,7 +625,7 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	headersSent, integrityErr, writeErr := streamVerified(w, rdr, obj.Size, obj.SHA256, func() {
+	headersSent, integrityErr, writeErr := streamVerified(dw, rdr, obj.Size, obj.SHA256, func() {
 		writeObjectHeaders(w, obj, obj.Size)
 		w.WriteHeader(http.StatusOK)
 	})
@@ -613,7 +644,7 @@ func (h *handler) handleGetOrHeadObject(w http.ResponseWriter, r *http.Request, 
 
 // streamVerified streams r to w while verifying size and SHA-256. The final
 // chunk is held back until EOF and checksum verification succeed.
-func streamVerified(w http.ResponseWriter, r io.Reader, wantSize int64, wantSHA256 string, sendHeaders func()) (headersSent bool, integrityErr error, writeErr error) {
+func streamVerified(w io.Writer, r io.Reader, wantSize int64, wantSHA256 string, sendHeaders func()) (headersSent bool, integrityErr error, writeErr error) {
 	curr := make([]byte, streamBufSize)
 	prev := make([]byte, streamBufSize)
 	prevLen := 0
@@ -671,6 +702,36 @@ func abortConnection(w http.ResponseWriter) {
 		return
 	}
 	panic(http.ErrAbortHandler)
+}
+
+type deadlineReader struct {
+	r       io.Reader
+	rc      *http.ResponseController
+	timeout time.Duration
+}
+
+func (d *deadlineReader) Read(p []byte) (int, error) {
+	if d.timeout > 0 {
+		if err := d.rc.SetReadDeadline(time.Now().Add(d.timeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return 0, err
+		}
+	}
+	return d.r.Read(p)
+}
+
+type deadlineWriter struct {
+	w       io.Writer
+	rc      *http.ResponseController
+	timeout time.Duration
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	if d.timeout > 0 {
+		if err := d.rc.SetWriteDeadline(time.Now().Add(d.timeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return 0, err
+		}
+	}
+	return d.w.Write(p)
 }
 
 func writeObjectHeaders(w http.ResponseWriter, obj domain.Object, contentLength int64) {
@@ -751,6 +812,12 @@ func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err e
 		h.writeError(w, r, http.StatusBadRequest, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.")
 	case errors.Is(err, domain.ErrEntityTooLarge):
 		h.writeError(w, r, http.StatusBadRequest, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+	case errors.Is(err, domain.ErrInsufficientStorage):
+		h.writeError(w, r, http.StatusInsufficientStorage, "InsufficientStorage", "There is not enough free storage space for this operation.")
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
+		h.writeError(w, r, http.StatusRequestTimeout, "RequestTimeout", "Your socket connection to the server was not read from or written to within the timeout period.")
+	case errors.Is(err, context.Canceled):
+		h.writeError(w, r, http.StatusRequestTimeout, "RequestTimeout", "The request was canceled before completion.")
 	case errors.Is(err, domain.ErrInvalidKey),
 		errors.Is(err, domain.ErrInvalidMetadata),
 		errors.Is(err, domain.ErrInvalidToken),
@@ -784,6 +851,9 @@ func (h *handler) writeMappedError(w http.ResponseWriter, r *http.Request, err e
 }
 
 func (h *handler) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
 	if r.Method == http.MethodHead {
 		w.WriteHeader(status)
 		return
