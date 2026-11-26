@@ -66,16 +66,25 @@ func TestSemaphoreOverloadReturns503(t *testing.T) {
 	<-r1.started
 	<-r2.started
 
-	// Give server handlers a brief moment to settle inside the semaphore.
-	var resp *http.Response
-	var body []byte
-	for i := 0; i < 20; i++ {
-		resp, body = doReq(t, http.MethodGet, ts.URL+"/photos?list-type=2", nil, nil)
-		if resp.StatusCode == http.StatusServiceUnavailable {
+	// Wait until both uploads hold the server's semaphore slots (metrics bypasses the semaphore).
+	deadline := time.Now().Add(3 * time.Second)
+	settled := false
+	for time.Now().Before(deadline) {
+		_, mBody := doReq(t, http.MethodGet, ts.URL+"/-/metrics", nil, nil)
+		if strings.Contains(string(mBody), "gostore_active_requests 2") {
+			settled = true
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	if !settled {
+		close(r1.release)
+		close(r2.release)
+		wg.Wait()
+		t.Fatal("uploads never acquired both semaphore slots")
+	}
+
+	resp, body := doReq(t, http.MethodGet, ts.URL+"/photos?list-type=2", nil, nil)
 	if resp.StatusCode != http.StatusServiceUnavailable ||
 		resp.Header.Get("Retry-After") != "1" ||
 		decodeErrorXML(t, body).Code != "SlowDown" {
