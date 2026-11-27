@@ -94,7 +94,8 @@ aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/archive.bin" s3://demo-bucket/b
 echo "[5/7] Listing with prefix and checking metrics..."
 aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket demo-bucket --prefix docs/ \
   --query 'Contents[].{Key:Key,Size:Size}' --output table
-curl -fsS "${ENDPOINT}/-/metrics" | grep -E '^(gostore_ready|gostore_requests_total)' | head -n 6
+metrics_out="$(curl -fsS "${ENDPOINT}/-/metrics")"
+grep -E '^(gostore_ready|gostore_requests_total)' <<<"$metrics_out" | awk 'NR<=6'
 
 echo "[6/7] Restarting GoStore to verify durable persistence..."
 stop_server

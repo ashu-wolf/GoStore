@@ -153,8 +153,9 @@ make bench
 - [docs/adr/0001-concurrency-and-resource-limits.md](docs/adr/0001-concurrency-and-resource-limits.md) — concurrency conflicts, pins, and overload/space limits
 - [docs/adr/0002-metadata-group-commit.md](docs/adr/0002-metadata-group-commit.md) — leader-follower metadata journal group commit
 - [docs/adr/0003-immutable-blobs-and-metadata-journal.md](docs/adr/0003-immutable-blobs-and-metadata-journal.md) — immutable sharded blobs and CRC-32C metadata journal
-- [Architecture guide](docs/architecture-guide.md)
-- [Function reference](docs/function-reference.md)
+- [docs/architecture-guide.md](docs/architecture-guide.md) — visual architecture guide and component walkthrough
+- [docs/function-reference.md](docs/function-reference.md) — reference of Go functions and methods across packages
+
 ## Limitations & Non-Goals
 
 - **Single-node only:** No replication, erasure coding, or multi-node consensus.

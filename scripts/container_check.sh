@@ -39,11 +39,13 @@ dd if=/dev/urandom of="${TMP_DIR}/payload.bin" bs=1024 count=256 status=none
 
 aws --endpoint-url "$ENDPOINT" s3 mb s3://container-bucket
 aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/payload.bin" s3://container-bucket/obj.bin
-aws --endpoint-url "$ENDPOINT" s3 ls s3://container-bucket/ | grep -q "obj.bin"
+ls_out="$(aws --endpoint-url "$ENDPOINT" s3 ls s3://container-bucket/)"
+grep -q "obj.bin" <<<"$ls_out"
 
 # Verify metrics endpoint reports requests without exposing object keys.
-curl -fsS "http://127.0.0.1:9000/-/metrics" | grep -q 'gostore_requests_total{op="put_object",status="200"}'
-if curl -fsS "http://127.0.0.1:9000/-/metrics" | grep -q "obj.bin"; then
+metrics_out="$(curl -fsS "http://127.0.0.1:9000/-/metrics")"
+grep -q 'gostore_requests_total{op="put_object",status="200"}' <<<"$metrics_out"
+if grep -q "obj.bin" <<<"$metrics_out"; then
   echo "metrics leaked object key"
   exit 1
 fi

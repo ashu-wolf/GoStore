@@ -57,8 +57,10 @@ aws --endpoint-url "$ENDPOINT" s3api put-object --bucket cli-bucket --key docs/h
 aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/large.bin" s3://cli-bucket/docs/large.bin
 aws --endpoint-url "$ENDPOINT" s3 cp "${TMP_DIR}/multipart.bin" s3://cli-bucket/docs/multipart.bin
 
-aws --endpoint-url "$ENDPOINT" s3 ls s3://cli-bucket/docs/ | grep -q "hello.txt"
-aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket cli-bucket --prefix docs/ | grep -q "docs/multipart.bin"
+ls_out="$(aws --endpoint-url "$ENDPOINT" s3 ls s3://cli-bucket/docs/)"
+grep -q "hello.txt" <<<"$ls_out"
+list_out="$(aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket cli-bucket --prefix docs/)"
+grep -q "docs/multipart.bin" <<<"$list_out"
 
 aws --endpoint-url "$ENDPOINT" s3api get-object --bucket cli-bucket --key docs/hello.txt "${TMP_DIR}/dl.txt" >/dev/null
 cmp -s "${TMP_DIR}/upload.txt" "${TMP_DIR}/dl.txt"
