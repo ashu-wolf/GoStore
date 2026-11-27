@@ -145,6 +145,7 @@ make bench
 
 ## Architecture, Durability & Reports
 
+- [docs/project-guide-for-beginners.md](docs/project-guide-for-beginners.md) — beginner-friendly explanation of concepts (S3, SigV4, Docker, durability), architecture, and full production code walkthrough
 - [docs/system-and-code-guide.md](docs/system-and-code-guide.md) — full system architecture, component breakdown, and package-by-package code walkthrough
 - [docs/architecture.md](docs/architecture.md) — system diagram, write protocol & commit point, read integrity check, and startup recovery
 - [docs/runbook.md](docs/runbook.md) — reverse-proxy TLS, Docker Compose operations, graceful shutdown, and backup/restore
